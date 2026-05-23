@@ -43,6 +43,10 @@ compile_commands.json
 *.lib
 *.pdb
 
+# Vendored upstream whisper.cpp checkout - fetched on demand by the
+# :sdk:prepareWhisper Gradle task, never committed (multi-MB C/C++ tree).
+**/cpp/whisper.cpp/
+
 # ----- AI Model Binaries (quantized Whisper models) -----
 # Large binary models are distributed out-of-band, never committed.
 *.bin
