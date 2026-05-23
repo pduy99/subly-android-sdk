@@ -9,7 +9,8 @@ package com.helios.subly.sdk.domain.model
  * @property pcm 16-bit signed PCM samples, mono or interleaved stereo.
  * @property sampleRateHz Source sample rate (typically 48_000 on modern devices).
  * @property channelCount 1 (mono) or 2 (stereo).
- * @property timestampMs Monotonic wall-clock time the frame was read.
+ * @property timestampMs Monotonic milliseconds since capture session start. Suitable for
+ *   duration math (silence window, caption alignment); NOT epoch time.
  * @property maxAbsSample Pre-computed loudest absolute sample in [pcm].
  */
 data class AudioFrame(
