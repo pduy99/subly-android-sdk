@@ -33,7 +33,14 @@ namespace {
 struct WhisperHandle {
     whisper_context* ctx = nullptr;
     std::string targetLang;
-    bool translate = true; // whisper translation is target=English only
+    // Whisper's built-in translation only produces English. We keep it OFF
+    // here so the transcript stays in the source language and the ML Kit NMT
+    // stage handles the full source->target pair (avoiding lossy double
+    // translation when the user picks a non-English target).
+    bool translate = false;
+    // BCP-47 tag of the language detected by whisper on the LAST
+    // nativeTranscribe call; empty until the first call returns.
+    std::string lastDetectedLang;
 };
 #endif
 
@@ -75,8 +82,8 @@ Java_com_helios_subly_sdk_data_ai_WhisperNative_nativeInit(
         LOGE("nativeInit: whisper_init_from_file_with_params failed for %s", modelPath.c_str());
         return 0;
     }
-    auto* h = new WhisperHandle{ctx, targetLang, true};
-    LOGI("nativeInit: ok, target=%s", targetLang.c_str());
+    auto* h = new WhisperHandle{ctx, targetLang, /*translate=*/false, /*lastDetectedLang=*/""};
+    LOGI("nativeInit: ok, target=%s, translate=off", targetLang.c_str());
     return reinterpret_cast<jlong>(h);
 #else
     (void)env; (void)jModelPath; (void)jTargetLang;
@@ -98,7 +105,7 @@ Java_com_helios_subly_sdk_data_ai_WhisperNative_nativeTranscribe(
 
     whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     params.language        = "auto";       // PRD: source locked to auto-detect
-    params.translate       = h->translate; // English-only target (see note in Kotlin layer)
+    params.translate       = h->translate; // OFF by default — see WhisperHandle comment.
     params.print_progress  = false;
     params.print_realtime  = false;
     params.print_timestamps= false;
@@ -113,7 +120,18 @@ Java_com_helios_subly_sdk_data_ai_WhisperNative_nativeTranscribe(
 
     if (whisper_full(h->ctx, params, pcm.data(), static_cast<int>(pcm.size())) != 0) {
         LOGE("nativeTranscribe: whisper_full failed");
+        h->lastDetectedLang.clear();
         return env->NewStringUTF("");
+    }
+    // Capture the language detected by whisper on this call. We stash on the
+    // handle so the Kotlin layer can query it via nativeLastDetectedLang
+    // without changing the transcribe return signature.
+    const int langId = whisper_full_lang_id(h->ctx);
+    if (langId >= 0) {
+        const char* code = whisper_lang_str(langId);
+        h->lastDetectedLang = code != nullptr ? code : "";
+    } else {
+        h->lastDetectedLang.clear();
     }
     std::string out;
     const int n_seg = whisper_full_n_segments(h->ctx);
@@ -124,6 +142,19 @@ Java_com_helios_subly_sdk_data_ai_WhisperNative_nativeTranscribe(
     return env->NewStringUTF(out.c_str());
 #else
     (void)env; (void)handle; (void)jPcm; (void)sampleRate;
+    return env->NewStringUTF("");
+#endif
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_helios_subly_sdk_data_ai_WhisperNative_nativeLastDetectedLang(
+    JNIEnv* env, jobject, jlong handle) {
+#ifdef SUBLY_HAS_WHISPER
+    if (handle == 0) return env->NewStringUTF("");
+    auto* h = reinterpret_cast<WhisperHandle*>(handle);
+    return env->NewStringUTF(h->lastDetectedLang.c_str());
+#else
+    (void)handle;
     return env->NewStringUTF("");
 #endif
 }

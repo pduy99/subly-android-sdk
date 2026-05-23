@@ -112,6 +112,7 @@ class SublyEngineImplTest {
         assertEquals(listOf("frame@0", "frame@50", "frame@100"), received.map { it.text })
         assertTrue(received.all { it.targetLanguageCode == "es" })
         engine.stopTranslationPipeline()
+        advanceUntilIdle()
         assertTrue(capture.stopped)
         assertTrue(transcriber.released)
     }

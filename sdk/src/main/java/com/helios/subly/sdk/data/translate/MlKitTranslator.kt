@@ -69,11 +69,16 @@ internal class MlKitTranslator(
         sourceBcp47: String,
         targetBcp47: String,
     ): DownloadResult {
-        if (sourceBcp47.equals(targetBcp47, ignoreCase = true)) return DownloadResult.Success
+        if (sourceBcp47.equals(targetBcp47, ignoreCase = true)) {
+            return DownloadResult.Success
+        }
         return try {
             val client = acquire(sourceBcp47.lowercase(), targetBcp47.lowercase())
-            if (client.ensureModel()) DownloadResult.Success
-            else DownloadResult.Failed(IllegalStateException("ML Kit downloadModelIfNeeded returned failure"))
+            if (client.ensureModel()) {
+                DownloadResult.Success
+            } else {
+                DownloadResult.Failed(IllegalStateException("ML Kit downloadModelIfNeeded returned failure"))
+            }
         } catch (t: Throwable) {
             DownloadResult.Failed(t)
         }

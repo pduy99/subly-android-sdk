@@ -9,8 +9,12 @@ import com.helios.subly.sdk.data.vision.ImageReaderDataSource
 import com.helios.subly.sdk.data.vision.MlKitOcrRecognizer
 import com.helios.subly.sdk.data.vision.VirtualDisplayCaptureSource
 import com.helios.subly.sdk.domain.repository.SublyEngine
+import com.helios.subly.sdk.domain.repository.SublyModelRegistry
 
 internal object DefaultSublyEngineFactory : SublyEngine.Factory {
+    override fun createModelRegistry(context: Context): SublyModelRegistry =
+        DefaultSublyModelRegistry(context.applicationContext)
+
     override fun create(context: Context): SublyEngine {
         val appContext = context.applicationContext
         return SublyEngineImpl(

@@ -62,7 +62,9 @@ internal class SublyEngineImpl(
         mediaProjection: MediaProjection,
         targetLanguageCode: String,
     ): SharedFlow<TranslationPacket> {
-        if (pipelineJob?.isActive == true) return packets.asSharedFlow()
+        if (pipelineJob?.isActive == true) {
+            return packets.asSharedFlow()
+        }
 
         _engineState.value = EngineState.Starting
         val processAudio = ProcessAudioStreamUseCase(audioCapture, transcriber)
@@ -88,7 +90,11 @@ internal class SublyEngineImpl(
             _engineState.value = EngineState.Capturing(EngineState.CaptureMode.AUDIO)
             val raw = processAudio(mediaProjection, config)
             val translated = translateStage?.invoke(raw, config) ?: raw
-            translated.collect { packets.tryEmit(it) }
+            var emitted = 0
+            translated.collect { p ->
+                emitted++
+                packets.tryEmit(p)
+            }
         }
 
         return packets.asSharedFlow()
@@ -100,9 +106,15 @@ internal class SublyEngineImpl(
         pipelineJob?.cancel(); pipelineJob = null
         stopVisionFallback()
         audioCapture.stop()
-        transcriber.release()
-        translator?.release()
-        _engineState.value = EngineState.Idle
+        // Native release blocks until any in-flight JNI transcribe()
+        // completes (see WhisperTranscriber.nativeLock). Punt it to the
+        // engine scope's worker dispatcher so we don't ANR a UI/main-thread
+        // caller (e.g. FGS.onDestroy).
+        scope.launch {
+            runCatching { transcriber.release() }
+            runCatching { translator?.release() }
+            _engineState.value = EngineState.Idle
+        }
     }
 
     /**

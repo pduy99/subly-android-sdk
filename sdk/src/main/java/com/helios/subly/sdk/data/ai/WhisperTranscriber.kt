@@ -29,14 +29,14 @@ import java.util.concurrent.atomic.AtomicLong
  * Translation responsibility (Phase 3b):
  * Whisper here ONLY produces source-language text. The downstream
  * `TranslatePacketUseCase` runs the ML Kit NMT step to reach the requested
- * target. Emitted packets carry `sourceLanguageCode = "auto"` until the JNI
- * surfaces `whisper_full_lang_id`; the use case fills in the real source
- * via its own language identifier as a fallback.
+ * target. Emitted packets carry the BCP-47 source language whisper
+ * detected (via `whisper_full_lang_id`); the use case falls back to ML
+ * Kit Lang-ID only when whisper couldn't identify.
  */
 internal class WhisperTranscriber(
     private val context: Context,
     private val model: WhisperModel = WhisperModel.Default,
-    private val chunker: AudioChunker = AudioChunker(),
+    private val segmenter: SpeechSegmenter = SpeechSegmenter(),
     private val backend: WhisperBackend = WhisperBackend.Jni,
     private val modelLoaderFactory: WhisperModelLoaderFactory = WhisperModelLoaderFactory.Default,
     private val ocrRecognizer: OcrRecognizer? = null,
@@ -44,39 +44,55 @@ internal class WhisperTranscriber(
 
     private val handleRef = AtomicLong(0L)
 
+    /**
+     * Serializes JNI `transcribe` and `release` so the native context is
+     * never freed while an inference is still running on a worker thread.
+     * Whisper.cpp / GGML inference is non-cancellable from Kotlin (it's a
+     * blocking JNI call), so coroutine cancellation can't interrupt it —
+     * without this lock, `stop()` racing a chunk inference causes a
+     * SIGSEGV in libggml-cpu.so.
+     */
+    private val nativeLock = Any()
+
     override fun transcribeAudio(
         frames: Flow<AudioFrame>,
         config: LanguageConfig,
     ): Flow<TranslationPacket> {
         if (!backend.isAvailable()) {
-            Log.w(TAG, "Whisper backend unavailable; draining audio without transcription.")
             return frames.transform { /* drain, preserve backpressure */ }
         }
 
         val handle = ensureHandle(config.targetLanguageCode)
         if (handle == 0L) {
-            Log.w(TAG, "Whisper init failed; draining audio without transcription.")
             return frames.transform { /* drain */ }
         }
 
-        return chunker.chunk(frames)
+        var windowCount = 0
+        return segmenter.chunk(frames)
             .transform { window ->
-                val text = runCatching {
-                    backend.transcribe(handle, window.pcm, window.sampleRateHz)
+                windowCount++
+                // Pair (text, detectedLang) is captured under the same lock
+                // so the language matches the transcript on the JNI side.
+                val (text, detectedLang) = runCatching {
+                    synchronized(nativeLock) {
+                        val h = handleRef.get()
+                        if (h == 0L) "" to "" else {
+                            val t = backend.transcribe(h, window.pcm, window.sampleRateHz)
+                            t to backend.lastDetectedLang(h)
+                        }
+                    }
                 }.getOrElse {
-                    Log.e(TAG, "transcribe() failed", it)
-                    ""
-                }.trim()
+                    "" to ""
+                }.let { (t, l) -> t.trim() to l }
 
                 if (text.isNotEmpty()) {
                     emit(
                         TranslationPacket(
                             text = text,
-                            // "auto" = source detected by Whisper but not yet
-                            // surfaced; downstream NMT will identify if needed.
-                            sourceLanguageCode = "auto",
-                            // We forward the requested target so the NMT stage
-                            // can decide whether to translate or pass-through.
+                            // Whisper-detected language ("en", "vi", ...). Falls
+                            // back to "auto" if whisper couldn't identify; the
+                            // NMT stage will run ML Kit Lang-ID as a backstop.
+                            sourceLanguageCode = detectedLang.ifEmpty { "auto" },
                             targetLanguageCode = config.targetLanguageCode,
                             timestampMs = window.startTimestampMs,
                             source = TranslationPacket.Source.AUDIO,
@@ -122,16 +138,22 @@ internal class WhisperTranscriber(
     }
 
     override fun release() {
-        val h = handleRef.getAndSet(0L)
-        if (h != 0L) runCatching { backend.release(h) }
+        // Hold nativeLock so we wait for any in-flight transcribe() to
+        // complete before freeing the context. Without this, a stop()
+        // race against an active chunk causes a SIGSEGV in GGML.
+        synchronized(nativeLock) {
+            val h = handleRef.getAndSet(0L)
+            if (h != 0L) runCatching { backend.release(h) }
+        }
         runCatching { ocrRecognizer?.close() }
     }
 
     private fun ensureHandle(targetLanguageCode: String): Long {
         val existing = handleRef.get()
-        if (existing != 0L) return existing
+        if (existing != 0L) {
+            return existing
+        }
         val modelPath = modelLoaderFactory.create(context).resolve(model) ?: run {
-            Log.w(TAG, "No Whisper model on disk (looked for ${model.assetName}).")
             return 0L
         }
         val created = backend.init(modelPath, targetLanguageCode)

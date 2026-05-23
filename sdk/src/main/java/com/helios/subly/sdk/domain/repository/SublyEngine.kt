@@ -27,6 +27,13 @@ interface SublyEngine {
 
     interface Factory {
         fun create(context: Context): SublyEngine
+
+        /**
+         * Builds the SDK's [SublyModelRegistry]. Independent from [create] so
+         * the Consumer can pre-flight downloads before the user ever taps
+         * Start (no capture/JNI resources are allocated by this call).
+         */
+        fun createModelRegistry(context: Context): SublyModelRegistry
     }
 
     companion object {

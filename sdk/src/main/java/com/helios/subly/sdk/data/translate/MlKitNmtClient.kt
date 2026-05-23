@@ -1,9 +1,12 @@
 package com.helios.subly.sdk.data.translate
 
+import com.google.mlkit.common.MlKitException
 import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.languageid.LanguageIdentificationOptions
 import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 
@@ -32,15 +35,32 @@ internal object MlKitNmt {
                     .build(),
             )
             object : NmtClient {
-                override suspend fun ensureModel(): Boolean = runCatching {
-                    // Wi-Fi-only by default; the Consumer UI can pre-warm via
-                    // its own `RemoteModelManager` calls when the user opts in
-                    // to metered downloads.
-                    translator.downloadModelIfNeeded(
-                        DownloadConditions.Builder().requireWifi().build(),
-                    ).await()
-                    true
-                }.getOrDefault(false)
+                override suspend fun ensureModel(): Boolean {
+                    val tag = "$source->$target"
+                    val t0 = System.currentTimeMillis()
+                    runCatching {
+                        val mgr = RemoteModelManager.getInstance()
+                        val srcModel = TranslateRemoteModel.Builder(srcCode).build()
+                        val tgtModel = TranslateRemoteModel.Builder(tgtCode).build()
+                        val srcReady = mgr.isModelDownloaded(srcModel).await()
+                        val tgtReady = mgr.isModelDownloaded(tgtModel).await()
+                    }.onFailure {
+                    }
+
+                    return try {
+                        translator.downloadModelIfNeeded(
+                            DownloadConditions.Builder().build(),
+                        ).await()
+                        val ms = System.currentTimeMillis() - t0
+                        true
+                    } catch (e: MlKitException) {
+                        val ms = System.currentTimeMillis() - t0
+                        false
+                    } catch (t: Throwable) {
+                        val ms = System.currentTimeMillis() - t0
+                        false
+                    }
+                }
 
                 override suspend fun translate(text: String): String =
                     translator.translate(text).await()

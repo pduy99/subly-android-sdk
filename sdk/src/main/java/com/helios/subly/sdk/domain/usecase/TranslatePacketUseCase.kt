@@ -29,7 +29,9 @@ class TranslatePacketUseCase(
     ): Flow<TranslationPacket> = packets.transform { raw ->
         val target = config.targetLanguageCode
         val text = raw.text
-        if (text.isBlank()) return@transform
+        if (text.isBlank()) {
+            return@transform
+        }
 
         val source = raw.sourceLanguageCode
             ?.takeUnless { it.equals(AUTO, ignoreCase = true) }

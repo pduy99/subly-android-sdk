@@ -32,6 +32,15 @@ internal object WhisperNative {
     /** Runs full inference over one PCM window; returns concatenated text. */
     external fun nativeTranscribe(handle: Long, pcm: FloatArray, sampleRate: Int): String
 
+    /**
+     * Returns the BCP-47 tag of the language whisper detected on the most
+     * recent [nativeTranscribe] call (e.g. "en", "vi"). Empty string if no
+     * call has succeeded yet, or whisper couldn't identify a language. Must
+     * be called under the same lock that serializes [nativeTranscribe] /
+     * [nativeRelease] (see `WhisperTranscriber.nativeLock`).
+     */
+    external fun nativeLastDetectedLang(handle: Long): String
+
     external fun nativeRelease(handle: Long)
 
     private external fun nativeIsAvailable(): Boolean
