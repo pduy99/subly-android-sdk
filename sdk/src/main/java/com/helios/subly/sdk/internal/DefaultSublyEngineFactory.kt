@@ -4,6 +4,7 @@ import android.content.Context
 import com.helios.subly.sdk.data.ai.WhisperTranscriber
 import com.helios.subly.sdk.data.audio.AudioPlaybackCaptureSource
 import com.helios.subly.sdk.data.audio.AudioRecordDataSource
+import com.helios.subly.sdk.data.translate.MlKitTranslator
 import com.helios.subly.sdk.domain.repository.SublyEngine
 
 internal object DefaultSublyEngineFactory : SublyEngine.Factory {
@@ -16,6 +17,10 @@ internal object DefaultSublyEngineFactory : SublyEngine.Factory {
             // or the on-disk model isn't available, so wiring it
             // unconditionally is safe on CI and stub-built devices.
             transcriber = WhisperTranscriber(appContext),
+            // On-device NMT bridge. Requires Google Play Services at runtime;
+            // when GMS is absent or a language pair is unsupported, the
+            // translator degrades to pass-through (source-language text).
+            translator = MlKitTranslator(),
         )
     }
 }

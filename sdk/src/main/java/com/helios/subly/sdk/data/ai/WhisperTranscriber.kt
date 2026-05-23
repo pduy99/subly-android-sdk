@@ -26,10 +26,12 @@ import java.util.concurrent.atomic.AtomicLong
  *    no packets. This preserves backpressure and lets the engine come up on
  *    devices/CI without the AI core.
  *
- * Translation target caveat (also called out in the native README):
- * Whisper's built-in translate mode is English-only. For non-English targets
- * we emit source-language text with `sourceLanguageCode = "auto"`; a later
- * NMT stage will translate to the requested target.
+ * Translation responsibility (Phase 3b):
+ * Whisper here ONLY produces source-language text. The downstream
+ * `TranslatePacketUseCase` runs the ML Kit NMT step to reach the requested
+ * target. Emitted packets carry `sourceLanguageCode = "auto"` until the JNI
+ * surfaces `whisper_full_lang_id`; the use case fills in the real source
+ * via its own language identifier as a fallback.
  */
 internal class WhisperTranscriber(
     private val context: Context,
@@ -56,7 +58,6 @@ internal class WhisperTranscriber(
             return frames.transform { /* drain */ }
         }
 
-        val targetIsEnglish = config.targetLanguageCode.equals("en", ignoreCase = true)
         return chunker.chunk(frames)
             .transform { window ->
                 val text = runCatching {
@@ -70,11 +71,12 @@ internal class WhisperTranscriber(
                     emit(
                         TranslationPacket(
                             text = text,
+                            // "auto" = source detected by Whisper but not yet
+                            // surfaced; downstream NMT will identify if needed.
                             sourceLanguageCode = "auto",
-                            // Whisper translates to English when translate=true is set
-                            // native-side; for other targets we surface the transcript
-                            // and tag the requested target so downstream NMT can act.
-                            targetLanguageCode = if (targetIsEnglish) "en" else config.targetLanguageCode,
+                            // We forward the requested target so the NMT stage
+                            // can decide whether to translate or pass-through.
+                            targetLanguageCode = config.targetLanguageCode,
                             timestampMs = window.startTimestampMs,
                             source = TranslationPacket.Source.AUDIO,
                             isFinal = true,

@@ -8,8 +8,10 @@ import com.helios.subly.sdk.domain.model.TranslationPacket
 import com.helios.subly.sdk.domain.repository.AiTranscriberRepository
 import com.helios.subly.sdk.domain.repository.AudioCaptureRepository
 import com.helios.subly.sdk.domain.repository.SublyEngine
+import com.helios.subly.sdk.domain.repository.TranslatorRepository
 import com.helios.subly.sdk.domain.usecase.DetectSystemSilenceUseCase
 import com.helios.subly.sdk.domain.usecase.ProcessAudioStreamUseCase
+import com.helios.subly.sdk.domain.usecase.TranslatePacketUseCase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,6 +33,7 @@ internal class SublyEngineImpl(
     private val appContext: Context,
     private val audioCapture: AudioCaptureRepository,
     private val transcriber: AiTranscriberRepository,
+    private val translator: TranslatorRepository? = null,
     private val silenceDetector: DetectSystemSilenceUseCase = DetectSystemSilenceUseCase(),
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : SublyEngine {
@@ -59,6 +62,7 @@ internal class SublyEngineImpl(
 
         _engineState.value = EngineState.Starting
         val processAudio = ProcessAudioStreamUseCase(audioCapture, transcriber)
+        val translateStage = translator?.let { TranslatePacketUseCase(it) }
         val config = LanguageConfig(targetLanguageCode)
 
         // Subscribe to amplitudes before launching capture so the silence detector
@@ -75,7 +79,9 @@ internal class SublyEngineImpl(
 
         pipelineJob = scope.launch {
             _engineState.value = EngineState.Capturing(EngineState.CaptureMode.AUDIO)
-            processAudio(mediaProjection, config).collect { packets.tryEmit(it) }
+            val raw = processAudio(mediaProjection, config)
+            val translated = translateStage?.invoke(raw, config) ?: raw
+            translated.collect { packets.tryEmit(it) }
         }
 
         return packets.asSharedFlow()
@@ -87,6 +93,7 @@ internal class SublyEngineImpl(
         pipelineJob?.cancel(); pipelineJob = null
         audioCapture.stop()
         transcriber.release()
+        translator?.release()
         _engineState.value = EngineState.Idle
     }
 }
