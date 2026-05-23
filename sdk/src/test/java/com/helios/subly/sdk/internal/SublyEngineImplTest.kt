@@ -10,6 +10,7 @@ import com.helios.subly.sdk.domain.model.TranslationPacket
 import com.helios.subly.sdk.domain.model.VisionFrame
 import com.helios.subly.sdk.domain.repository.AiTranscriberRepository
 import com.helios.subly.sdk.domain.repository.AudioCaptureRepository
+import com.helios.subly.sdk.domain.repository.VisionCaptureRepository
 import com.helios.subly.sdk.domain.usecase.DetectSystemSilenceUseCase
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -137,6 +138,87 @@ class SublyEngineImplTest {
         val drmReached = engine.engineState.first { it is EngineState.DrmBlocked }
         assertEquals(EngineState.DrmBlocked, drmReached)
         engine.stopTranslationPipeline()
+    }
+
+    private class FakeVisionCapture(
+        private val synthetic: List<VisionFrame>,
+    ) : VisionCaptureRepository {
+        var stopped: Boolean = false
+            private set
+
+        override fun frames(mediaProjection: MediaProjection, targetFps: Int): Flow<VisionFrame> =
+            synthetic.asFlow()
+
+        override fun stop() {
+            stopped = true
+        }
+    }
+
+    private class OcrTranscriber : AiTranscriberRepository {
+        var released: Boolean = false
+            private set
+
+        override fun transcribeAudio(
+            frames: Flow<AudioFrame>,
+            config: LanguageConfig,
+        ): Flow<TranslationPacket> = kotlinx.coroutines.flow.flow {
+            // Drain upstream so FakeCapture emits amplitudes to the silence
+            // detector, but produce no packets (audio path is silent here).
+            frames.collect { }
+        }
+
+        override fun recognizeVision(
+            frames: Flow<VisionFrame>,
+            config: LanguageConfig,
+        ): Flow<TranslationPacket> = frames.map {
+            TranslationPacket(
+                text = "ocr@${it.timestampMs}",
+                sourceLanguageCode = null,
+                targetLanguageCode = config.targetLanguageCode,
+                timestampMs = it.timestampMs,
+                source = TranslationPacket.Source.VISION,
+                isFinal = true,
+            )
+        }
+
+        override fun release() {
+            released = true
+        }
+    }
+
+    @Test
+    fun `vision fallback activates and emits OCR packets on DrmBlocked`() = runTest {
+        // Silence > 2 s triggers DRM-blocked; vision capture then spins up.
+        val silentFrames = listOf(
+            frame(maxAbs = 0, ts = 0),
+            frame(maxAbs = 0, ts = 2_100),
+        )
+        val ocrFrame = VisionFrame(
+            pixels = ByteArray(0),
+            width = 0, height = 0, rowStrideBytes = 0,
+            timestampMs = 3_000,
+        )
+        val capture = FakeCapture(silentFrames)
+        val vision = FakeVisionCapture(listOf(ocrFrame))
+        val transcriber = OcrTranscriber()
+        val engine = SublyEngineImpl(
+            appContext = fakeContext,
+            audioCapture = capture,
+            transcriber = transcriber,
+            visionCapture = vision,
+            silenceDetector = DetectSystemSilenceUseCase(silenceEpsilon = 32, silenceWindowMs = 2_000L),
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val packets = engine.startTranslationPipeline(fakeProjection, "vi")
+        val collected = async(start = CoroutineStart.UNDISPATCHED) { packets.take(1).first() }
+        advanceUntilIdle()
+        val received = collected.await()
+
+        assertEquals("ocr@3000", received.text)
+        assertEquals(TranslationPacket.Source.VISION, received.source)
+        engine.stopTranslationPipeline()
+        assertTrue(vision.stopped)
     }
 
     private fun frame(maxAbs: Int, ts: Long): AudioFrame = AudioFrame(

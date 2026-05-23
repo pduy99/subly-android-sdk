@@ -9,8 +9,10 @@ import com.helios.subly.sdk.domain.repository.AiTranscriberRepository
 import com.helios.subly.sdk.domain.repository.AudioCaptureRepository
 import com.helios.subly.sdk.domain.repository.SublyEngine
 import com.helios.subly.sdk.domain.repository.TranslatorRepository
+import com.helios.subly.sdk.domain.repository.VisionCaptureRepository
 import com.helios.subly.sdk.domain.usecase.DetectSystemSilenceUseCase
 import com.helios.subly.sdk.domain.usecase.ProcessAudioStreamUseCase
+import com.helios.subly.sdk.domain.usecase.ProcessOcrFrameUseCase
 import com.helios.subly.sdk.domain.usecase.TranslatePacketUseCase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,7 @@ internal class SublyEngineImpl(
     private val audioCapture: AudioCaptureRepository,
     private val transcriber: AiTranscriberRepository,
     private val translator: TranslatorRepository? = null,
+    private val visionCapture: VisionCaptureRepository? = null,
     private val silenceDetector: DetectSystemSilenceUseCase = DetectSystemSilenceUseCase(),
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : SublyEngine {
@@ -53,6 +56,7 @@ internal class SublyEngineImpl(
 
     private var pipelineJob: Job? = null
     private var silenceJob: Job? = null
+    private var visionJob: Job? = null
 
     override fun startTranslationPipeline(
         mediaProjection: MediaProjection,
@@ -62,6 +66,7 @@ internal class SublyEngineImpl(
 
         _engineState.value = EngineState.Starting
         val processAudio = ProcessAudioStreamUseCase(audioCapture, transcriber)
+        val processOcr = visionCapture?.let { ProcessOcrFrameUseCase(it, transcriber) }
         val translateStage = translator?.let { TranslatePacketUseCase(it) }
         val config = LanguageConfig(targetLanguageCode)
 
@@ -69,10 +74,12 @@ internal class SublyEngineImpl(
         // doesn't miss the first frames (amplitudes is a replay=0 SharedFlow).
         silenceJob = scope.launch {
             silenceDetector(audioCapture.amplitudes()).collect { silenced ->
-                _engineState.value = if (silenced) {
-                    EngineState.DrmBlocked
+                if (silenced) {
+                    _engineState.value = EngineState.DrmBlocked
+                    startVisionFallback(mediaProjection, config, translateStage, processOcr)
                 } else {
-                    EngineState.Capturing(EngineState.CaptureMode.AUDIO)
+                    _engineState.value = EngineState.Capturing(EngineState.CaptureMode.AUDIO)
+                    stopVisionFallback()
                 }
             }
         }
@@ -91,9 +98,35 @@ internal class SublyEngineImpl(
         _engineState.value = EngineState.Stopping
         silenceJob?.cancel(); silenceJob = null
         pipelineJob?.cancel(); pipelineJob = null
+        stopVisionFallback()
         audioCapture.stop()
         transcriber.release()
         translator?.release()
         _engineState.value = EngineState.Idle
+    }
+
+    /**
+     * Spawn the vision fallback flow on the first DRM-block. Idempotent: a
+     * subsequent silence event while [visionJob] is still active is a no-op,
+     * so a flapping silence detector won't churn `VirtualDisplay` resources.
+     */
+    private fun startVisionFallback(
+        mediaProjection: MediaProjection,
+        config: LanguageConfig,
+        translateStage: TranslatePacketUseCase?,
+        processOcr: ProcessOcrFrameUseCase?,
+    ) {
+        if (processOcr == null) return
+        if (visionJob?.isActive == true) return
+        visionJob = scope.launch {
+            val raw = processOcr(mediaProjection, config)
+            val translated = translateStage?.invoke(raw, config) ?: raw
+            translated.collect { packets.tryEmit(it) }
+        }
+    }
+
+    private fun stopVisionFallback() {
+        visionJob?.cancel(); visionJob = null
+        visionCapture?.stop()
     }
 }

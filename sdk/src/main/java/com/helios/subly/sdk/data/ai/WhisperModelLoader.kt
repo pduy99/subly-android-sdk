@@ -20,6 +20,19 @@ import java.io.FileOutputStream
  * Unpacking is required because whisper.cpp reads via `fopen`; APK assets are
  * not real files on disk.
  */
+/**
+ * Builds a [WhisperModelLoader] bound to an Android [Context]. Lifted to an
+ * interface so [WhisperTranscriber] can be unit-tested with a fake without
+ * passing function references.
+ */
+internal interface WhisperModelLoaderFactory {
+    fun create(context: Context): WhisperModelLoader
+
+    companion object Default : WhisperModelLoaderFactory {
+        override fun create(context: Context): WhisperModelLoader = WhisperModelLoader(context)
+    }
+}
+
 internal open class WhisperModelLoader(private val context: Context) {
 
     private val modelsDir: File by lazy {

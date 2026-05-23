@@ -2,6 +2,7 @@ package com.helios.subly.sdk.data.ai
 
 import android.content.Context
 import android.util.Log
+import com.helios.subly.sdk.data.vision.OcrRecognizer
 import com.helios.subly.sdk.domain.model.AudioFrame
 import com.helios.subly.sdk.domain.model.LanguageConfig
 import com.helios.subly.sdk.domain.model.TranslationPacket
@@ -9,7 +10,6 @@ import com.helios.subly.sdk.domain.model.VisionFrame
 import com.helios.subly.sdk.domain.repository.AiTranscriberRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.transform
 import java.util.concurrent.atomic.AtomicLong
@@ -38,7 +38,8 @@ internal class WhisperTranscriber(
     private val model: WhisperModel = WhisperModel.Default,
     private val chunker: AudioChunker = AudioChunker(),
     private val backend: WhisperBackend = WhisperBackend.Jni,
-    private val modelLoaderFactory: (Context) -> WhisperModelLoader = ::WhisperModelLoader,
+    private val modelLoaderFactory: WhisperModelLoaderFactory = WhisperModelLoaderFactory.Default,
+    private val ocrRecognizer: OcrRecognizer? = null,
 ) : AiTranscriberRepository {
 
     private val handleRef = AtomicLong(0L)
@@ -90,17 +91,46 @@ internal class WhisperTranscriber(
     override fun recognizeVision(
         frames: Flow<VisionFrame>,
         config: LanguageConfig,
-    ): Flow<TranslationPacket> = emptyFlow() // Phase 4
+    ): Flow<TranslationPacket> {
+        val ocr = ocrRecognizer ?: run {
+            Log.w(TAG, "No OCR recognizer wired; draining vision frames.")
+            return frames.transform { /* drain */ }
+        }
+        // Suppress duplicate emissions (OCR often returns the same caption
+        // across consecutive frames at 2 fps).
+        var lastText = ""
+        return frames
+            .transform { frame ->
+                val text = ocr.recognize(frame)
+                if (text.isEmpty() || text == lastText) return@transform
+                lastText = text
+                emit(
+                    TranslationPacket(
+                        text = text,
+                        // OCR output language is unknown; the downstream NMT
+                        // stage runs language-id and decides translate vs.
+                        // pass-through.
+                        sourceLanguageCode = "auto",
+                        targetLanguageCode = config.targetLanguageCode,
+                        timestampMs = frame.timestampMs,
+                        source = TranslationPacket.Source.VISION,
+                        isFinal = true,
+                    ),
+                )
+            }
+            .flowOn(Dispatchers.Default)
+    }
 
     override fun release() {
         val h = handleRef.getAndSet(0L)
         if (h != 0L) runCatching { backend.release(h) }
+        runCatching { ocrRecognizer?.close() }
     }
 
     private fun ensureHandle(targetLanguageCode: String): Long {
         val existing = handleRef.get()
         if (existing != 0L) return existing
-        val modelPath = modelLoaderFactory(context).resolve(model) ?: run {
+        val modelPath = modelLoaderFactory.create(context).resolve(model) ?: run {
             Log.w(TAG, "No Whisper model on disk (looked for ${model.assetName}).")
             return 0L
         }

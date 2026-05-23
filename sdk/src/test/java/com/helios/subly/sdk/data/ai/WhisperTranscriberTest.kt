@@ -48,6 +48,10 @@ class WhisperTranscriberTest {
         override fun resolve(model: WhisperModel): String? = path
     }
 
+    private class FakeLoaderFactory(private val loader: WhisperModelLoader) : WhisperModelLoaderFactory {
+        override fun create(context: Context): WhisperModelLoader = loader
+    }
+
     @Test
     fun `degrades to drain when backend unavailable`() = runTest {
         val backend = FakeBackend(available = false)
@@ -55,7 +59,7 @@ class WhisperTranscriberTest {
             context = ctx,
             chunker = AudioChunker(windowMs = 100, hopMs = 100),
             backend = backend,
-            modelLoaderFactory = { FakeLoader("/dev/null") },
+            modelLoaderFactory = FakeLoaderFactory(FakeLoader("/dev/null")),
         )
         val frames = listOf(silentFrame(timestampMs = 0))
         val packets = transcriber.transcribeAudio(frames.asFlow(), LanguageConfig("en")).toList()
@@ -71,7 +75,7 @@ class WhisperTranscriberTest {
             context = ctx,
             chunker = AudioChunker(windowMs = 100, hopMs = 100),
             backend = backend,
-            modelLoaderFactory = { FakeLoader(path = null) },
+            modelLoaderFactory = FakeLoaderFactory(FakeLoader(path = null)),
         )
         val packets = transcriber.transcribeAudio(listOf(silentFrame(0)).asFlow(), LanguageConfig("en")).toList()
 
@@ -86,7 +90,7 @@ class WhisperTranscriberTest {
             context = ctx,
             chunker = AudioChunker(windowMs = 100, hopMs = 100),
             backend = backend,
-            modelLoaderFactory = { FakeLoader("/data/local/model.bin") },
+            modelLoaderFactory = FakeLoaderFactory(FakeLoader("/data/local/model.bin")),
         )
         // Produce 4 windows worth of audio (4 x 100 ms frames).
         val frames = (0 until 4).map { i ->
@@ -116,7 +120,7 @@ class WhisperTranscriberTest {
             context = ctx,
             chunker = AudioChunker(windowMs = 100, hopMs = 100),
             backend = backend,
-            modelLoaderFactory = { FakeLoader("/data/local/model.bin") },
+            modelLoaderFactory = FakeLoaderFactory(FakeLoader("/data/local/model.bin")),
         )
         val frames = listOf(
             AudioFrame(ShortArray(1_600) { 500 }, 16_000, 1, 0L, 500),
@@ -135,7 +139,7 @@ class WhisperTranscriberTest {
             context = ctx,
             chunker = AudioChunker(windowMs = 100, hopMs = 100),
             backend = backend,
-            modelLoaderFactory = { FakeLoader("/data/local/model.bin") },
+            modelLoaderFactory = FakeLoaderFactory(FakeLoader("/data/local/model.bin")),
         )
         transcriber.transcribeAudio(
             listOf(AudioFrame(ShortArray(1_600) { 1 }, 16_000, 1, 0, 1)).asFlow(),
