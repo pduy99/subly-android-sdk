@@ -1,0 +1,109 @@
+# ----- Gradle -----
+.gradle/
+build/
+/build
+**/build/
+!**/src/**/build/
+!**/src/test/**/build/
+out/
+.gradletasknamecache
+
+# ----- Kotlin / KSP / KAPT -----
+.kotlin/
+**/generated/
+**/kapt/
+**/ksp/
+
+# ----- Android / IDE -----
+*.iml
+*.ipr
+*.iws
+.idea/
+!.idea/.gitignore
+.navigation/
+captures/
+/captures
+
+# ----- Native / NDK / CMake (Whisper.cpp JNI) -----
+.cxx/
+.externalNativeBuild/
+**/.cxx/
+**/.externalNativeBuild/
+**/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Compiled native artifacts (built per-ABI by NDK, not checked in)
+*.o
+*.a
+*.so.dbg
+*.exp
+*.lib
+*.pdb
+
+# ----- AI Model Binaries (quantized Whisper models) -----
+# Large binary models are distributed out-of-band, never committed.
+*.bin
+*.gguf
+*.ggml
+*.tflite
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+**/models/*.zip
+**/assets/models/
+
+# ----- ML Kit runtime caches -----
+**/mlkit_*/
+**/com.google.mlkit.*/
+
+# ----- Local / Secret config (CRITICAL for a public repo) -----
+local.properties
+/local.properties
+**/local.properties
+*.keystore
+*.jks
+*.p12
+*.pfx
+keystore.properties
+signing.properties
+.env
+.env.*
+secrets.properties
+api-keys.properties
+google-services.json
+firebase-credentials.json
+
+# ----- OS metadata -----
+.DS_Store
+**/.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ----- Logs / Crash dumps / Profiler -----
+*.log
+*.hprof
+hs_err_pid*.log
+replay_pid*.log
+
+# ----- Test / Coverage outputs -----
+**/test-results/
+**/jacoco/
+**/coverage/
+*.exec
+
+# ----- Publishing artifacts -----
+/repo/
+/maven-local/
+**/maven-publish/
+
+# ----- Documentation outputs (Dokka, Javadoc) -----
+**/dokka/
+**/javadoc/
+docs/build/
