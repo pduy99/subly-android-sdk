@@ -23,15 +23,6 @@ interface AiTranscriberRepository {
         config: LanguageConfig,
     ): Flow<TranslationPacket>
 
-    /**
-     * Run text recognition over a stream of screen frames and translate the
-     * recognized text into the target language.
-     */
-    fun recognizeVision(
-        frames: Flow<VisionFrame>,
-        config: LanguageConfig,
-    ): Flow<TranslationPacket>
-
     /** Eagerly release native AI resources (Whisper context, ML Kit recognizer). */
     fun release()
 }

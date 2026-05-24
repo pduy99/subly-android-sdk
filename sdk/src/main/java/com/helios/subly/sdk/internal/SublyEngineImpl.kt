@@ -1,7 +1,7 @@
 package com.helios.subly.sdk.internal
 
-import android.content.Context
 import android.media.projection.MediaProjection
+import com.helios.subly.sdk.data.vision.OcrRecognizer
 import com.helios.subly.sdk.domain.model.EngineState
 import com.helios.subly.sdk.domain.model.LanguageConfig
 import com.helios.subly.sdk.domain.model.TranslationPacket
@@ -32,11 +32,11 @@ import kotlin.coroutines.CoroutineContext
  * Default [SublyEngine] implementation.
  */
 internal class SublyEngineImpl(
-    private val appContext: Context,
     private val audioCapture: AudioCaptureRepository,
     private val transcriber: AiTranscriberRepository,
     private val translator: TranslatorRepository? = null,
     private val visionCapture: VisionCaptureRepository? = null,
+    private val ocrRecognizer: OcrRecognizer? = null,
     private val silenceDetector: DetectSystemSilenceUseCase = DetectSystemSilenceUseCase(),
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : SublyEngine {
@@ -68,7 +68,11 @@ internal class SublyEngineImpl(
 
         _engineState.value = EngineState.Starting
         val processAudio = ProcessAudioStreamUseCase(audioCapture, transcriber)
-        val processOcr = visionCapture?.let { ProcessOcrFrameUseCase(it, transcriber) }
+        val processOcr = if (visionCapture != null && ocrRecognizer != null) {
+            ProcessOcrFrameUseCase(visionCapture, ocrRecognizer)
+        } else {
+            null
+        }
         val translateStage = translator?.let { TranslatePacketUseCase(it) }
         val config = LanguageConfig(targetLanguageCode)
 
@@ -107,7 +111,7 @@ internal class SublyEngineImpl(
         stopVisionFallback()
         audioCapture.stop()
         // Native release blocks until any in-flight JNI transcribe()
-        // completes (see WhisperTranscriber.nativeLock). Punt it to the
+        // completes. Punt it to the
         // engine scope's worker dispatcher so we don't ANR a UI/main-thread
         // caller (e.g. FGS.onDestroy).
         scope.launch {

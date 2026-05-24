@@ -33,6 +33,7 @@ internal class ImageReaderDataSource(
     private val maxLongEdgePx: Int = 1280,
 ) : VirtualDisplayDataSource {
 
+    @Volatile private var activeMediaProjection: MediaProjection? = null
     @Volatile private var virtualDisplay: VirtualDisplay? = null
     @Volatile private var imageReader: ImageReader? = null
     @Volatile private var handlerThread: HandlerThread? = null
@@ -40,7 +41,7 @@ internal class ImageReaderDataSource(
 
     @Synchronized
     override fun open(mediaProjection: MediaProjection, targetFps: Int) {
-        check(virtualDisplay == null) { "ImageReaderDataSource already open" }
+        check(imageReader == null) { "ImageReaderDataSource already open" }
 
         val (w, h, dpi) = screenMetrics()
         val (outW, outH) = scaleToMax(w, h, maxLongEdgePx)
@@ -51,14 +52,25 @@ internal class ImageReaderDataSource(
         // producer. Larger queues just stall the producer when OCR can't
         // keep up; we'd rather drop frames via acquireLatestImage().
         val reader = ImageReader.newInstance(outW, outH, PixelFormat.RGBA_8888, 2)
-        val display = mediaProjection.createVirtualDisplay(
-            "SublyVisionVD",
-            outW, outH, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface,
-            /* callback = */ null,
-            handler,
-        )
+        
+        if (activeMediaProjection === mediaProjection && virtualDisplay != null) {
+            // Android 14+ throws SecurityException if createVirtualDisplay is called 
+            // multiple times on the same MediaProjection instance. Reuse the existing one.
+            virtualDisplay!!.resize(outW, outH, dpi)
+            virtualDisplay!!.surface = reader.surface
+        } else {
+            virtualDisplay?.release()
+            val display = mediaProjection.createVirtualDisplay(
+                "SublyVisionVD",
+                outW, outH, dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface,
+                /* callback = */ null,
+                handler,
+            )
+            virtualDisplay = display
+            activeMediaProjection = mediaProjection
+        }
         val ch = Channel<RawVisionFrame>(
             capacity = 1,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -66,7 +78,6 @@ internal class ImageReaderDataSource(
 
         handlerThread = thread
         imageReader = reader
-        virtualDisplay = display
         channel = ch
 
         val frameIntervalMs = if (targetFps > 0) 1000L / targetFps else 0L
@@ -102,8 +113,11 @@ internal class ImageReaderDataSource(
     override fun close() {
         runCatching { channel?.close() }
         channel = null
-        runCatching { virtualDisplay?.release() }
-        virtualDisplay = null
+        
+        // Pause the virtual display instead of releasing it to avoid SecurityException 
+        // if this MediaProjection is reused later.
+        runCatching { virtualDisplay?.surface = null }
+        
         runCatching { imageReader?.setOnImageAvailableListener(null, null) }
         runCatching { imageReader?.close() }
         imageReader = null

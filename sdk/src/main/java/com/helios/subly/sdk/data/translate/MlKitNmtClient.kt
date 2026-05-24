@@ -36,7 +36,6 @@ internal object MlKitNmt {
             )
             object : NmtClient {
                 override suspend fun ensureModel(): Boolean {
-                    val tag = "$source->$target"
                     val t0 = System.currentTimeMillis()
                     runCatching {
                         val mgr = RemoteModelManager.getInstance()

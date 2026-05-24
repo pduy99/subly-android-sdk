@@ -5,10 +5,6 @@ plugins {
 group = "com.helios.subly.sdk"
 version = "0.0.1"
 
-apply(from = rootProject.file("gradle/whisper-bootstrap.gradle.kts"))
-
-val sublyHasWhisper: Boolean = (extra["sublyHasWhisper"] as? Boolean) ?: false
-
 android {
     namespace = "com.helios.subly.sdk"
     compileSdk {
@@ -25,23 +21,10 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-                // Auto-detected: ON once `:sdk:prepareWhisper` has cloned
-                // whisper.cpp into src/main/cpp/whisper.cpp/. Otherwise the
-                // stub library builds and the Kotlin layer self-degrades.
-                arguments += "-DSUBLY_HAS_WHISPER=${if (sublyHasWhisper) "ON" else "OFF"}"
-            }
-        }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
+    aaptOptions {
+        noCompress.addAll(listOf("onnx", "txt", "model"))
     }
 
     compileOptions {
@@ -55,6 +38,15 @@ android {
 }
 
 dependencies {
+    // sherpa-onnx is `compileOnly` because AGP refuses to bundle a local
+    // .aar inside another .aar (this module is `com.android.library`, so
+    // its build output is itself an AAR). The Consumer app re-declares the
+    // same .aar as `implementation(files(...))` so the final APK actually
+    // packages sherpa-onnx classes + `libsherpa-onnx-jni.so`. Without that
+    // app-side declaration, [SherpaOnnxBackend.Jni.isAvailable] returns
+    // false at runtime and [SherpaOnnxTranscriber] drains.
+    compileOnly(fileTree("libs") { include("*.aar") })
+
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.mlkit.translate)

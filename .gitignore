@@ -60,6 +60,7 @@ compile_commands.json
 *.safetensors
 **/models/*.zip
 **/assets/models/
+libs/
 
 # ----- ML Kit runtime caches -----
 **/mlkit_*/

@@ -2,6 +2,7 @@ package com.helios.subly.sdk.internal
 
 import android.content.Context
 import android.media.projection.MediaProjection
+import com.helios.subly.sdk.data.vision.OcrRecognizer
 import com.helios.subly.sdk.domain.model.Amplitude
 import com.helios.subly.sdk.domain.model.AudioFrame
 import com.helios.subly.sdk.domain.model.EngineState
@@ -35,7 +36,6 @@ class SublyEngineImplTest {
 
     // `MediaProjection` / `Context` are final + `Stub!` in unit tests; mock them so the engine has something to pass through.
     private val fakeProjection: MediaProjection = org.mockito.kotlin.mock()
-    private val fakeContext: Context = org.mockito.kotlin.mock()
 
     private class FakeCapture(
         private val synthetic: List<AudioFrame>,
@@ -75,11 +75,6 @@ class SublyEngineImplTest {
             )
         }
 
-        override fun recognizeVision(
-            frames: Flow<VisionFrame>,
-            config: LanguageConfig,
-        ): Flow<TranslationPacket> = kotlinx.coroutines.flow.emptyFlow()
-
         override fun release() {
             released = true
         }
@@ -95,7 +90,6 @@ class SublyEngineImplTest {
         val capture = FakeCapture(frames)
         val transcriber = EchoTranscriber()
         val engine = SublyEngineImpl(
-            appContext = fakeContext,
             audioCapture = capture,
             transcriber = transcriber,
             dispatcher = StandardTestDispatcher(testScheduler),
@@ -126,7 +120,6 @@ class SublyEngineImplTest {
         )
         val capture = FakeCapture(frames)
         val engine = SublyEngineImpl(
-            appContext = fakeContext,
             audioCapture = capture,
             transcriber = EchoTranscriber(),
             silenceDetector = DetectSystemSilenceUseCase(silenceEpsilon = 32, silenceWindowMs = 2_000L),
@@ -155,7 +148,20 @@ class SublyEngineImplTest {
         }
     }
 
-    private class OcrTranscriber : AiTranscriberRepository {
+    private class FakeOcrRecognizer : OcrRecognizer {
+        var closed: Boolean = false
+            private set
+
+        override suspend fun recognize(frame: VisionFrame): String {
+            return "ocr@${frame.timestampMs}"
+        }
+
+        override fun close() {
+            closed = true
+        }
+    }
+
+    private class SilentTranscriber : AiTranscriberRepository {
         var released: Boolean = false
             private set
 
@@ -163,23 +169,7 @@ class SublyEngineImplTest {
             frames: Flow<AudioFrame>,
             config: LanguageConfig,
         ): Flow<TranslationPacket> = kotlinx.coroutines.flow.flow {
-            // Drain upstream so FakeCapture emits amplitudes to the silence
-            // detector, but produce no packets (audio path is silent here).
             frames.collect { }
-        }
-
-        override fun recognizeVision(
-            frames: Flow<VisionFrame>,
-            config: LanguageConfig,
-        ): Flow<TranslationPacket> = frames.map {
-            TranslationPacket(
-                text = "ocr@${it.timestampMs}",
-                sourceLanguageCode = null,
-                targetLanguageCode = config.targetLanguageCode,
-                timestampMs = it.timestampMs,
-                source = TranslationPacket.Source.VISION,
-                isFinal = true,
-            )
         }
 
         override fun release() {
@@ -201,12 +191,12 @@ class SublyEngineImplTest {
         )
         val capture = FakeCapture(silentFrames)
         val vision = FakeVisionCapture(listOf(ocrFrame))
-        val transcriber = OcrTranscriber()
+        val transcriber = SilentTranscriber()
         val engine = SublyEngineImpl(
-            appContext = fakeContext,
             audioCapture = capture,
             transcriber = transcriber,
             visionCapture = vision,
+            ocrRecognizer = FakeOcrRecognizer(),
             silenceDetector = DetectSystemSilenceUseCase(silenceEpsilon = 32, silenceWindowMs = 2_000L),
             dispatcher = StandardTestDispatcher(testScheduler),
         )

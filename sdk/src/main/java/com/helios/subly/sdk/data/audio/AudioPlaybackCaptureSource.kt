@@ -1,6 +1,7 @@
 package com.helios.subly.sdk.data.audio
 
 import android.media.projection.MediaProjection
+import android.util.Log
 import com.helios.subly.sdk.domain.model.Amplitude
 import com.helios.subly.sdk.domain.model.AudioFrame
 import com.helios.subly.sdk.domain.repository.AudioCaptureRepository
@@ -63,7 +64,9 @@ internal class AudioPlaybackCaptureSource(
                 if (read == AudioCaptureDataSource.READ_STOPPED) {
                     break
                 }
-                if (read <= 0) continue // transient (ERROR_BAD_VALUE etc.) - skip
+                if (read <= 0) {
+                    continue
+                } // transient (ERROR_BAD_VALUE etc.) - skip
                 val pcm = if (read == buffer.size) buffer.copyOf() else buffer.copyOf(read)
                 val maxAbs = PcmAmplitude.maxAbsSample(pcm, read)
                 val ts = sessionStart.elapsedNow().inWholeMilliseconds
