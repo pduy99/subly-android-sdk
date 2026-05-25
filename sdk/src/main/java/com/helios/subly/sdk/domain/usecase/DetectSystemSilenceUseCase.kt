@@ -1,6 +1,7 @@
 package com.helios.subly.sdk.domain.usecase
 
 import com.helios.subly.sdk.domain.model.Amplitude
+import com.helios.subly.sdk.domain.repository.MediaPlaybackRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.flow
  *   (default 2000 ms, matching PRD).
  */
 class DetectSystemSilenceUseCase(
+    private val mediaPlaybackRepository: MediaPlaybackRepository,
     private val silenceEpsilon: Int = DEFAULT_EPSILON,
     private val silenceWindowMs: Long = DEFAULT_WINDOW_MS,
 ) {
@@ -31,7 +33,7 @@ class DetectSystemSilenceUseCase(
 
         amplitudes.collect { sample ->
             val silentNow = sample.maxAbsSample <= silenceEpsilon
-            val isSilenced = if (silentNow) {
+            val isSilenced = if (silentNow && mediaPlaybackRepository.isMediaPlaying()) {
                 val start = silenceStartedAtMs ?: sample.timestampMs.also {
                     silenceStartedAtMs = it
                 }

@@ -37,7 +37,7 @@ internal class SublyEngineImpl(
     private val translator: TranslatorRepository? = null,
     private val visionCapture: VisionCaptureRepository? = null,
     private val ocrRecognizer: OcrRecognizer? = null,
-    private val silenceDetector: DetectSystemSilenceUseCase = DetectSystemSilenceUseCase(),
+    private val silenceDetector: DetectSystemSilenceUseCase,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : SublyEngine {
 

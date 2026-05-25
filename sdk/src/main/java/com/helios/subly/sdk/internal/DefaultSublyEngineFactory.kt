@@ -8,6 +8,8 @@ import com.helios.subly.sdk.data.translate.MlKitTranslator
 import com.helios.subly.sdk.data.vision.ImageReaderDataSource
 import com.helios.subly.sdk.data.vision.MlKitOcrRecognizer
 import com.helios.subly.sdk.data.vision.VirtualDisplayCaptureSource
+import com.helios.subly.sdk.data.audio.AndroidMediaPlaybackRepository
+import com.helios.subly.sdk.domain.usecase.DetectSystemSilenceUseCase
 import com.helios.subly.sdk.domain.repository.SublyEngine
 import com.helios.subly.sdk.domain.repository.SublyModelRegistry
 
@@ -17,6 +19,9 @@ internal object DefaultSublyEngineFactory : SublyEngine.Factory {
 
     override fun create(context: Context): SublyEngine {
         val appContext = context.applicationContext
+        
+        val mediaPlaybackRepo = AndroidMediaPlaybackRepository(appContext)
+        
         return SublyEngineImpl(
             audioCapture = AudioPlaybackCaptureSource(dataSource = AudioRecordDataSource()),
             transcriber = SherpaOnnxTranscriber(context = appContext),
@@ -30,6 +35,9 @@ internal object DefaultSublyEngineFactory : SublyEngine.Factory {
                 dataSource = ImageReaderDataSource(appContext),
             ),
             ocrRecognizer = MlKitOcrRecognizer(),
+            silenceDetector = DetectSystemSilenceUseCase(
+                mediaPlaybackRepository = mediaPlaybackRepo
+            ),
         )
     }
 

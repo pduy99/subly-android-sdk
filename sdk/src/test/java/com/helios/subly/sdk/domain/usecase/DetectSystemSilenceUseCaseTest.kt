@@ -1,6 +1,7 @@
 package com.helios.subly.sdk.domain.usecase
 
 import com.helios.subly.sdk.domain.model.Amplitude
+import com.helios.subly.sdk.domain.repository.MediaPlaybackRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
@@ -11,7 +12,13 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class DetectSystemSilenceUseCaseTest {
 
+    private val fakeMediaPlaybackRepository = object : MediaPlaybackRepository {
+        var isPlaying = true
+        override fun isMediaPlaying(): Boolean = isPlaying
+    }
+
     private val useCase = DetectSystemSilenceUseCase(
+        mediaPlaybackRepository = fakeMediaPlaybackRepository,
         silenceEpsilon = 32,
         silenceWindowMs = 2_000L,
     )
@@ -112,5 +119,47 @@ class DetectSystemSilenceUseCaseTest {
         val edges = useCase(samples).toList()
 
         assertEquals(listOf(true), edges)
+    }
+
+    @Test
+    fun `does not emit true if media is not playing`() = runTest {
+        fakeMediaPlaybackRepository.isPlaying = false
+        val samples = flowOf(
+            Amplitude(maxAbsSample = 0, timestampMs = 0),
+            Amplitude(maxAbsSample = 0, timestampMs = 2_000),
+        )
+
+        val edges = useCase(samples).toList()
+
+        assertEquals(emptyList<Boolean>(), edges)
+    }
+
+    @Test
+    fun `resets timer if media stops playing during silence`() = runTest {
+        var callCount = 0
+        val mockRepo = object : MediaPlaybackRepository {
+            override fun isMediaPlaying(): Boolean {
+                callCount++
+                // Returns true for the first 2 samples (t=0, t=1000), 
+                // but false on the 3rd sample (t=2000), so the timer resets
+                return callCount <= 2
+            }
+        }
+        val customUseCase = DetectSystemSilenceUseCase(
+            mediaPlaybackRepository = mockRepo,
+            silenceEpsilon = 32,
+            silenceWindowMs = 2_000L,
+        )
+
+        val samples = flowOf(
+            Amplitude(maxAbsSample = 0, timestampMs = 0),
+            Amplitude(maxAbsSample = 0, timestampMs = 1_000),
+            Amplitude(maxAbsSample = 0, timestampMs = 2_000),
+            Amplitude(maxAbsSample = 0, timestampMs = 3_000), // media is false, so no emit
+        )
+
+        val edges = customUseCase(samples).toList()
+
+        assertEquals(emptyList<Boolean>(), edges)
     }
 }
