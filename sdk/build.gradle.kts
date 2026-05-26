@@ -24,7 +24,7 @@ android {
     }
 
     aaptOptions {
-        noCompress.addAll(listOf("onnx", "txt", "model"))
+        noCompress.addAll(listOf("ort", "txt"))
     }
 
     compileOptions {
@@ -49,8 +49,7 @@ dependencies {
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.mlkit.translate)
-    implementation(libs.mlkit.language.id)
+    implementation(libs.onnxruntime.android)
     implementation(libs.mlkit.text.recognition)
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

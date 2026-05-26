@@ -12,6 +12,7 @@ import com.helios.subly.sdk.domain.model.VisionFrame
 import com.helios.subly.sdk.domain.repository.AiTranscriberRepository
 import com.helios.subly.sdk.domain.repository.AudioCaptureRepository
 import com.helios.subly.sdk.domain.repository.VisionCaptureRepository
+import com.helios.subly.sdk.domain.repository.MediaPlaybackRepository
 import com.helios.subly.sdk.domain.usecase.DetectSystemSilenceUseCase
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -36,6 +37,11 @@ class SublyEngineImplTest {
 
     // `MediaProjection` / `Context` are final + `Stub!` in unit tests; mock them so the engine has something to pass through.
     private val fakeProjection: MediaProjection = org.mockito.kotlin.mock()
+
+    private class FakeMediaPlaybackRepository : MediaPlaybackRepository {
+        var playing = true
+        override fun isMediaPlaying(): Boolean = playing
+    }
 
     private class FakeCapture(
         private val synthetic: List<AudioFrame>,
@@ -92,6 +98,11 @@ class SublyEngineImplTest {
         val engine = SublyEngineImpl(
             audioCapture = capture,
             transcriber = transcriber,
+            silenceDetector = DetectSystemSilenceUseCase(
+                mediaPlaybackRepository = FakeMediaPlaybackRepository(),
+                silenceEpsilon = 32,
+                silenceWindowMs = 2_000L
+            ),
             dispatcher = StandardTestDispatcher(testScheduler),
         )
 
@@ -122,7 +133,11 @@ class SublyEngineImplTest {
         val engine = SublyEngineImpl(
             audioCapture = capture,
             transcriber = EchoTranscriber(),
-            silenceDetector = DetectSystemSilenceUseCase(silenceEpsilon = 32, silenceWindowMs = 2_000L),
+            silenceDetector = DetectSystemSilenceUseCase(
+                mediaPlaybackRepository = FakeMediaPlaybackRepository(),
+                silenceEpsilon = 32, 
+                silenceWindowMs = 2_000L
+            ),
             dispatcher = StandardTestDispatcher(testScheduler),
         )
 
@@ -197,7 +212,11 @@ class SublyEngineImplTest {
             transcriber = transcriber,
             visionCapture = vision,
             ocrRecognizer = FakeOcrRecognizer(),
-            silenceDetector = DetectSystemSilenceUseCase(silenceEpsilon = 32, silenceWindowMs = 2_000L),
+            silenceDetector = DetectSystemSilenceUseCase(
+                mediaPlaybackRepository = FakeMediaPlaybackRepository(),
+                silenceEpsilon = 32, 
+                silenceWindowMs = 2_000L
+            ),
             dispatcher = StandardTestDispatcher(testScheduler),
         )
 

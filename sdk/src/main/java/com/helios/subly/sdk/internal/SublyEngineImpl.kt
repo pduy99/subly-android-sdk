@@ -1,6 +1,7 @@
 package com.helios.subly.sdk.internal
 
 import android.media.projection.MediaProjection
+import com.helios.subly.sdk.data.ai.SherpaOnnxPunctuation
 import com.helios.subly.sdk.data.vision.OcrRecognizer
 import com.helios.subly.sdk.domain.model.EngineState
 import com.helios.subly.sdk.domain.model.LanguageConfig
@@ -25,7 +26,12 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import android.util.Log
 import kotlin.coroutines.CoroutineContext
 
 /**
@@ -35,6 +41,7 @@ internal class SublyEngineImpl(
     private val audioCapture: AudioCaptureRepository,
     private val transcriber: AiTranscriberRepository,
     private val translator: TranslatorRepository? = null,
+    private val punctuation: SherpaOnnxPunctuation? = null,
     private val visionCapture: VisionCaptureRepository? = null,
     private val ocrRecognizer: OcrRecognizer? = null,
     private val silenceDetector: DetectSystemSilenceUseCase,
@@ -57,6 +64,10 @@ internal class SublyEngineImpl(
     private var pipelineJob: Job? = null
     private var silenceJob: Job? = null
     private var visionJob: Job? = null
+
+    init {
+        punctuation?.init()
+    }
 
     override fun startTranslationPipeline(
         mediaProjection: MediaProjection,
@@ -90,16 +101,15 @@ internal class SublyEngineImpl(
             }
         }
 
-        pipelineJob = scope.launch {
-            _engineState.value = EngineState.Capturing(EngineState.CaptureMode.AUDIO)
-            val raw = processAudio(mediaProjection, config)
-            val translated = translateStage?.invoke(raw, config) ?: raw
-            var emitted = 0
-            translated.collect { p ->
-                emitted++
-                packets.tryEmit(p)
+        _engineState.value = EngineState.Capturing(EngineState.CaptureMode.AUDIO)
+        val raw = processAudio(mediaProjection, config)
+        pipelineJob = (translateStage?.invoke(raw, config) ?: raw)
+            .onEach { packets.emit(it) }
+            .catch { error ->
+                Log.e("SublyEngine", "Pipeline crashed", error)
+                _engineState.value = EngineState.Idle
             }
-        }
+            .launchIn(scope)
 
         return packets.asSharedFlow()
     }
@@ -117,6 +127,7 @@ internal class SublyEngineImpl(
         scope.launch {
             runCatching { transcriber.release() }
             runCatching { translator?.release() }
+            runCatching { punctuation?.release() }
             _engineState.value = EngineState.Idle
         }
     }
@@ -134,11 +145,18 @@ internal class SublyEngineImpl(
     ) {
         if (processOcr == null) return
         if (visionJob?.isActive == true) return
-        visionJob = scope.launch {
-            val raw = processOcr(mediaProjection, config)
-            val translated = translateStage?.invoke(raw, config) ?: raw
-            translated.collect { packets.tryEmit(it) }
-        }
+        
+        val raw = processOcr(mediaProjection, config)
+        // OCR text already arrives as complete recognised lines - no
+        // need for clause gating; mark them isFinal so NMT runs.
+        val finalised = raw // OCR pipeline emits isFinal=true packets.
+        
+        visionJob = (translateStage?.invoke(finalised, config) ?: finalised)
+            .onEach { packets.emit(it) }
+            .catch { error ->
+                Log.e("SublyEngine", "Vision pipeline crashed", error)
+            }
+            .launchIn(scope)
     }
 
     private fun stopVisionFallback() {

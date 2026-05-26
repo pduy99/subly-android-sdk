@@ -34,9 +34,9 @@ internal open class SherpaOnnxModelLoader(private val context: Context) {
     /** Absolute path to the model directory, or `null` if not ready. */
     open fun resolve(model: SherpaOnnxModel = SherpaOnnxModel.Default): String? {
         val target = File(rootDir, model.dirName)
-        if (hasRequiredFiles(target)) return target.absolutePath
+        if (hasRequiredFiles(model, target)) return target.absolutePath
 
-        if (unpackFromAssets(model, target) && hasRequiredFiles(target)) {
+        if (unpackFromAssets(model, target) && hasRequiredFiles(model, target)) {
             return target.absolutePath
         }
         Log.w(TAG, "Sherpa-onnx model '${model.dirName}' not available.")
@@ -47,9 +47,12 @@ internal open class SherpaOnnxModelLoader(private val context: Context) {
     @Suppress("unused")
     fun downloadTarget(model: SherpaOnnxModel): File = File(rootDir, model.dirName)
 
-    private fun hasRequiredFiles(dir: File): Boolean {
+    private fun hasRequiredFiles(model: SherpaOnnxModel, dir: File): Boolean {
         if (!dir.isDirectory) return false
-        return REQUIRED_FILES.all { File(dir, it).exists() }
+        val filesInDir = dir.listFiles()?.map { it.name }.orEmpty()
+        return model.assetPatterns.all { pattern ->
+            filesInDir.any { fileName -> pattern.matches(fileName) }
+        }
     }
 
     private fun unpackFromAssets(model: SherpaOnnxModel, target: File): Boolean {
@@ -75,11 +78,5 @@ internal open class SherpaOnnxModelLoader(private val context: Context) {
         const val TAG = "SublySherpaOnnxLoader"
         const val MODELS_DIR = "sherpa-onnx"
         const val ASSETS_DIR = "sherpa-onnx"
-        val REQUIRED_FILES = listOf(
-            "encoder.onnx",
-            "decoder.onnx",
-            "joiner.onnx",
-            "tokens.txt",
-        )
     }
 }

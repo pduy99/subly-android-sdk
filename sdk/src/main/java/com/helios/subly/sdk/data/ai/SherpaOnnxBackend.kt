@@ -1,9 +1,11 @@
 package com.helios.subly.sdk.data.ai
 
 import android.util.Log
+import com.helios.subly.sdk.data.ai.JniSherpaOnnxBackend.isAvailable
 import com.k2fsa.sherpa.onnx.EndpointConfig
-import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OnlineCtcFstDecoderConfig
+import com.k2fsa.sherpa.onnx.OnlineLMConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
@@ -110,46 +112,30 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
         if (!available) return null
         return runCatching {
             val config = OnlineRecognizerConfig(
-                featConfig = FeatureConfig(
-                    sampleRate = sampleRateHz,
-                    featureDim = 80,
-                    dither = 0f,
-                ),
                 modelConfig = OnlineModelConfig(
                     transducer = OnlineTransducerModelConfig(
-                        encoder = "$modelDir/encoder.onnx",
-                        decoder = "$modelDir/decoder.onnx",
-                        joiner = "$modelDir/joiner.onnx",
+                        encoder = "$modelDir/encoder-epoch-99-avg-1.onnx",
+                        decoder = "$modelDir/decoder-epoch-99-avg-1.onnx",
+                        joiner = "$modelDir/joiner-epoch-99-avg-1.onnx",
                     ),
                     tokens = "$modelDir/tokens.txt",
-                    numThreads = NUM_THREADS,
+                    numThreads = 1,
                     debug = false,
-                    provider = "cpu",
-                    modelType = "zipformer",
                 ),
-                endpointConfig = EndpointConfig(
-                    // rule1: silence before any speech (we ignore — never triggers
-                    // inside an utterance because mustContainNonSilence=false).
-                    rule1 = EndpointRule(false, 2.4f, 0.0f),
-                    // rule2: trailing silence *after* speech — the workhorse.
-                    // 1.2 s is the sweet spot for caption UX: long enough to
-                    // ride through inter-word pauses, short enough that
-                    // sentence-end finals feel snappy.
-                    rule2 = EndpointRule(true, 1.2f, 0.0f),
-                    // rule3: hard cap so a continuous monologue still flushes
-                    // periodically (downstream NMT needs final commits to
-                    // settle).
-                    rule3 = EndpointRule(false, 0.0f, 20.0f),
+                lmConfig = OnlineLMConfig(),
+                featConfig = FeatureConfig(
+                    sampleRate = 16000,
+                    featureDim = 80,
                 ),
+                ctcFstDecoderConfig = OnlineCtcFstDecoderConfig(),
+                endpointConfig = EndpointConfig(),
                 enableEndpoint = true,
-                decodingMethod = "modified_beam_search",
+                decodingMethod = "greedy_search",
                 maxActivePaths = 4,
             )
-            // AssetManager = null -> recognizer loads from filesystem paths
-            // (which is what we want; assets-unpacking happens earlier in
-            // SherpaOnnxModelLoader).
+
             val recognizer = OnlineRecognizer(assetManager = null, config = config)
-            val stream = recognizer.createStream("")
+            val stream = recognizer.createStream()
             SherpaOnnxBackend.Handle(recognizer, stream)
         }.getOrElse { error ->
             Log.w(TAG, "sherpa-onnx init failed: ${error.message}")
@@ -190,12 +176,4 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
     }
 
     private val EMPTY = SherpaOnnxBackend.DecodeResult("", false)
-
-    /**
-     * 2 threads is the conventional sweet spot for streaming Zipformer on
-     * arm64-v8a phones — 1 underutilizes the big core, 4+ thrashes the
-     * shared L2 and actually slows decode. Tune per-device only if profiling
-     * shows real wins.
-     */
-    private const val NUM_THREADS = 2
 }

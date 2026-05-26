@@ -12,42 +12,6 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.transform
 import java.util.concurrent.atomic.AtomicReference
 
-/**
- * Streaming [AiTranscriberRepository] backed by sherpa-onnx (Next-gen Kaldi).
- *
- * Why this exists alongside [WhisperTranscriber]:
- *  - **True streaming.** Whisper is encoder-decoder and forces us to buffer
- *    an entire utterance (via [SpeechSegmenter]) before inference. Sherpa's
- *    online Zipformer transducer consumes audio frame-by-frame and emits
- *    partial hypotheses every ~200 ms, which is the only way to hit the
- *    "realtime caption" latency target.
- *  - **No GGML SIGSEGV foot-gun.** sherpa-onnx is cancellation-safe at the
- *    JNI boundary, so we don't need the [WhisperTranscriber.nativeLock]
- *    dance.
- *
- * Lifecycle:
- *  - First [transcribeAudio] call resolves the on-disk model dir, initializes
- *    the [SherpaOnnxBackend.Handle], and holds it until [release].
- *  - If sherpa-onnx isn't on the classpath, or the model isn't downloaded,
- *    the transcriber degrades to a drain — identical contract to whisper.
- *
- * Output contract:
- *  - Emits [TranslationPacket] with `isFinal = false` for in-progress
- *    hypotheses (debounced via [PARTIAL_MIN_INTERVAL_MS] to avoid flooding
- *    downstream NMT), and `isFinal = true` whenever the recognizer reports
- *    an endpoint.
- *  - `sourceLanguageCode` is set to `"auto"`: sherpa-onnx streaming models
- *    are usually mono- or bi-lingual, so the downstream
- *    `TranslatePacketUseCase` runs ML Kit Lang-ID as the source of truth.
- *
- * Audio assumptions:
- *  - Upstream [AudioFrame.pcm] is interleaved int16. We mono-mix (channel
- *    average) and normalize to float [-1, 1]. If the source sample rate
- *    differs from the model's [SherpaOnnxModel.sampleRateHz] we perform a
- *    cheap integer-ratio decimation (e.g. 48k → 16k via stride-3). Quality
- *    is sufficient for ASR; resort to a polyphase filter only if WER
- *    regresses.
- */
 internal class SherpaOnnxTranscriber(
     private val context: Context,
     private val model: SherpaOnnxModel = SherpaOnnxModel.Default,
@@ -211,7 +175,13 @@ internal class SherpaOnnxTranscriber(
         var srcIdx = 0
         var dstIdx = 0
         while (dstIdx < outLen) {
-            out[dstIdx++] = mono[srcIdx]
+            var sum = 0f
+            for (i in 0 until ratio) {
+                if (srcIdx + i < monoLen) {
+                    sum += mono[srcIdx + i]
+                }
+            }
+            out[dstIdx++] = sum / ratio
             srcIdx += ratio
         }
         return out
