@@ -169,6 +169,6 @@ internal class ImageReaderDataSource(
     }
 
     private companion object {
-        const val TAG = "SublyImageReaderDS"
+        const val TAG = "DUY"
     }
 }

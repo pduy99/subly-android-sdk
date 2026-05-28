@@ -1,10 +1,9 @@
 package com.helios.subly.sdk.domain.usecase
 
 import android.media.projection.MediaProjection
-import com.helios.subly.sdk.domain.model.LanguageConfig
-import com.helios.subly.sdk.domain.model.TranslationPacket
-import com.helios.subly.sdk.domain.repository.AiTranscriberRepository
-import com.helios.subly.sdk.domain.repository.AudioCaptureRepository
+import com.helios.subly.asr.api.AsrDataSource
+import com.helios.subly.core.data.repository.AudioCaptureRepository
+import com.helios.subly.core.model.TranslationPacket
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -13,11 +12,10 @@ import kotlinx.coroutines.flow.Flow
  */
 class ProcessAudioStreamUseCase(
     private val audioCapture: AudioCaptureRepository,
-    private val transcriber: AiTranscriberRepository,
+    private val transcriber: AsrDataSource,
 ) {
     operator fun invoke(
         mediaProjection: MediaProjection,
-        config: LanguageConfig,
     ): Flow<TranslationPacket> =
-        transcriber.transcribeAudio(audioCapture.frames(mediaProjection), config)
+        transcriber.transcribe(audioCapture.frames(mediaProjection))
 }

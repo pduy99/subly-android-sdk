@@ -23,4 +23,16 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Subly-Android-SDK"
+enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 include(":sdk")
+include(":core:data")
+include(":core:model")
+include(":audio:api")
+include(":audio:impl")
+include(":asr:api")
+include(":asr:sherpa")
+include(":asr:whisper")
+include(":translator:api")
+include(":translator:mlkit")
+include(":audio:api")
+include(":audio:impl")
