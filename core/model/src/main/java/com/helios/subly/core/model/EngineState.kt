@@ -14,6 +14,8 @@ sealed interface EngineState {
         val translatorState: ModelPrepState,
     ) : EngineState
 
+    data object Ready : EngineState
+
     data class Translating(
         val originalText: String,
         val translatedText: String,

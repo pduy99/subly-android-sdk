@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.launch
 
 class SublySession internal constructor(
@@ -63,10 +64,7 @@ class SublySession internal constructor(
                 }.collect()
                 
             if (_state.value !is EngineState.Error) {
-                // Once ready, you might want to explicitly set a Ready state, 
-                // but Preparing with (Ready, Ready) is handled by consumer. 
-                // We leave it as Preparing(Ready, Ready) or we could define a specific Ready state if it existed.
-                // Looking at EngineState.kt, if there is no separate Ready state, the app checks if both are Ready.
+                _state.value = EngineState.Ready
             }
         }
     }
@@ -81,26 +79,79 @@ class SublySession internal constructor(
             if (_state.value is EngineState.Error) return@launch
 
             // 2. Start Processing
+            val transcriptPool = StringBuilder()
             asrEngine.transcribe(audioCapture.frames(mediaProjection))
-                .map { asrResult ->
-                    val transcript = when (asrResult) {
-                        is AsrResult.Partial -> asrResult.text
-                        is AsrResult.Final -> asrResult.text
+                .transform { asrResult ->
+                    if (asrResult is AsrResult.Partial) {
+                        val partialState = processPartialResult(transcriptPool, asrResult.text)
+                        if (partialState != null) emit(partialState)
+                        return@transform
                     }
 
-                    // The engine handles translation implicitly based on prior preparation
-                    val translated = translationEngine.translate(transcript)
+                    val finalChunk = asrResult.text.trim()
+                    if (finalChunk.isEmpty()) return@transform
 
-                    EngineState.Translating(
-                        originalText = transcript,
-                        translatedText = translated,
-                        isFinal = asrResult is AsrResult.Final,
-                        mode = EngineState.CaptureMode.AUDIO,
-                    )
+                    appendFinalChunk(transcriptPool, finalChunk)
+
+                    while (true) {
+                        val finalState = extractNextCompletedSentence(transcriptPool)
+                        if (finalState != null) {
+                            emit(finalState)
+                        } else {
+                            break
+                        }
+                    }
                 }
                 .catch { e -> _state.value = EngineState.Error(e) }
                 .collect { _state.value = it }
         }
+    }
+
+    private suspend fun processPartialResult(
+        transcriptPool: StringBuilder,
+        partialText: String
+    ): EngineState.Translating? {
+        val trimmed = partialText.trim()
+        if (trimmed.isEmpty()) return null
+        
+        val tempSentence = ("$transcriptPool $trimmed").trim()
+        val translated = translationEngine.translate(tempSentence)
+        
+        return EngineState.Translating(
+            originalText = tempSentence,
+            translatedText = translated,
+            isFinal = false,
+            mode = EngineState.CaptureMode.AUDIO,
+        )
+    }
+
+    private fun appendFinalChunk(transcriptPool: StringBuilder, finalChunk: String) {
+        if (transcriptPool.isNotEmpty() && !transcriptPool.endsWith(" ")) {
+            transcriptPool.append(" ")
+        }
+        transcriptPool.append(finalChunk)
+    }
+
+    private suspend fun extractNextCompletedSentence(transcriptPool: StringBuilder): EngineState.Translating? {
+        val currentPool = transcriptPool.toString()
+        val words = currentPool.split("\\s+".toRegex()).filter { it.isNotEmpty() }
+        
+        val punctuationIndex = currentPool.indexOfAny(PUNCTUATION_MARKS)
+        val shouldExtract = punctuationIndex != -1 || words.size >= MAX_WORDS_PER_SENTENCE
+        
+        if (!shouldExtract) return null
+        
+        val extractEndIndex = if (punctuationIndex != -1) punctuationIndex + 1 else currentPool.length
+        val sentenceToTranslate = currentPool.substring(0, extractEndIndex).trim()
+        transcriptPool.delete(0, extractEndIndex)
+        
+        val translated = translationEngine.translate(sentenceToTranslate)
+        return EngineState.Translating(
+            originalText = sentenceToTranslate,
+            translatedText = translated,
+            isFinal = true,
+            mode = EngineState.CaptureMode.AUDIO,
+        )
     }
 
     override fun close() {
@@ -109,5 +160,10 @@ class SublySession internal constructor(
         asrEngine.release()
         translationEngine.release()
         _state.value = EngineState.Idle
+    }
+
+    companion object {
+        private val PUNCTUATION_MARKS = charArrayOf('.', '?', '!')
+        private const val MAX_WORDS_PER_SENTENCE = 20
     }
 }

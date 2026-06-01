@@ -161,7 +161,7 @@ class WhisperTranscriber(
             return outFile.absolutePath
         }
 
-        val modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin?download=true"
+        val modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${MODEL_ASSET}?download=true"
         modelDownloader.downloadModel(modelUrl, outFile).collect { progress ->
             onProgress(progress)
         }
