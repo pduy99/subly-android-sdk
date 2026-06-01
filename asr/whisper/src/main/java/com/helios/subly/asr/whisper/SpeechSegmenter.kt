@@ -1,47 +1,9 @@
 package com.helios.subly.asr.whisper
 
-import com.helios.subly.asr.whisper.SpeechSegmenter.Companion.MAX_SEGMENT_MS
-import com.helios.subly.asr.whisper.SpeechSegmenter.Companion.MIN_SEGMENT_MS
-import com.helios.subly.asr.whisper.SpeechSegmenter.Companion.PRE_ROLL_MS
-import com.helios.subly.asr.whisper.SpeechSegmenter.Companion.SILENCE_HANG_MS
-import com.helios.subly.asr.whisper.SpeechSegmenter.Companion.SPEECH_FRAMES_TO_OPEN
-import com.helios.subly.asr.whisper.SpeechSegmenter.Companion.SPEECH_THRESHOLD
 import com.helios.subly.core.model.AudioFrame
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
-/**
- * Voice-activity-detected (VAD) speech segmenter.
- *
- * Replaces the fixed 5 s sliding window with utterance-bounded segments so
- * captions appear within hundreds of milliseconds of the speaker pausing,
- * rather than every [HOP_MS] regardless of speech content.
- *
- * Algorithm (energy-based, runs on the existing per-frame `maxAbsSample`
- * already computed in [com.helios.subly.sdk.data.audio.PcmAmplitude]):
- *
- *  1. Maintain a small **pre-roll** ring buffer (~[PRE_ROLL_MS]) of
- *     pre-speech audio. This is prepended when speech is detected so the
- *     attack of the first syllable isn't clipped.
- *  2. **Enter speech** when [SPEECH_FRAMES_TO_OPEN] consecutive frames have
- *     amplitude > [SPEECH_THRESHOLD]. Append pre-roll + ongoing audio to
- *     the segment buffer.
- *  3. **Exit speech** when [SILENCE_HANG_MS] of continuous low-amplitude
- *     audio follow. Emit the segment if it's at least [MIN_SEGMENT_MS]
- *     (drops short noise spikes).
- *  4. **Force-flush** if a segment exceeds [MAX_SEGMENT_MS] — Whisper
- *     accuracy plateaus around 10–15 s anyway, and unbounded buffering
- *     starves downstream of any output during a continuous monologue.
- *
- * Stereo input is mono-mixed via channel average (same as the previous
- * chunker). Output [Window.startTimestampMs] is the timestamp of the
- * *first sample of speech* (post-pre-roll), so the UI can compute
- * playback→caption latency.
- *
- * @property threshold Speech vs silence amplitude cutoff in raw int16 units
- *   (range 0..32767). 500 ≈ −36 dBFS, which empirically clears YouTube's
- *   playback-capture noise floor while still triggering on quiet dialogue.
- */
 class SpeechSegmenter(
     private val threshold: Int = SPEECH_THRESHOLD,
     private val silenceHangMs: Int = SILENCE_HANG_MS,
@@ -127,12 +89,11 @@ class SpeechSegmenter(
     }
 
     private fun toWindow(buffer: ArrayDeque<Float>, sampleRateHz: Int, startMs: Long): Window {
-        val out = FloatArray(buffer.size)
-        var i = 0
-        while (i < out.size) {
-            out[i] = buffer[i]; i++
-        }
-        return Window(pcm = out, sampleRateHz = sampleRateHz, startTimestampMs = startMs)
+        return Window(
+            pcm = buffer.toFloatArray(),
+            sampleRateHz = sampleRateHz,
+            startTimestampMs = startMs
+        )
     }
 
     private fun appendAsMono(out: ArrayDeque<Float>, pcm: ShortArray, channelCount: Int) {
@@ -179,13 +140,13 @@ class SpeechSegmenter(
         const val SILENCE_HANG_MS = 600
 
         /** Hard cap on a single segment; force-flush past this. */
-        const val MAX_SEGMENT_MS = 8_000
+        const val MAX_SEGMENT_MS = 5_000
 
         /** Drop segments shorter than this (likely noise). */
-        const val MIN_SEGMENT_MS = 400
+        const val MIN_SEGMENT_MS = 1000
 
         /** Pre-buffered audio prepended when speech starts (catches attack). */
-        const val PRE_ROLL_MS = 200
+        const val PRE_ROLL_MS = 100
 
         /** Consecutive above-threshold frames required to open a segment. */
         const val SPEECH_FRAMES_TO_OPEN = 2

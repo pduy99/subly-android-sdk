@@ -1,83 +1,78 @@
 package com.helios.subly.translator.mlkit
 
+import android.util.Log
 import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.helios.subly.core.model.LanguageConfig
-import com.helios.subly.translator.api.TranslatorDataSource
-import kotlinx.coroutines.Dispatchers
+import com.helios.subly.core.model.ModelPrepState
+import com.helios.subly.translator.api.SublyTranslator
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
 
-/**
- * Fast draft translator using ML Kit's on-device NMT models.
- */
-class MlKitTranslator internal constructor(
-    @Suppress("unused") private val languageIdentifier: LanguageIdentifier,
-) : TranslatorDataSource {
+class MlKitTranslator : SublyTranslator {
 
-    constructor() : this(languageIdentifier = LanguageIdentifierImpl())
+    private var activeTranslator: Translator? = null
 
-    var modelLoaded = false
-
-    private lateinit var translator: Translator
-
-    override suspend fun translate(
-        text: String,
-        languageConfig: LanguageConfig,
-    ): String = withContext(Dispatchers.Default) {
-        if (!modelLoaded) {
-            if (!ensureModel(languageConfig)) return@withContext text
-        }
-
-        val translated = try {
-            translator.translate(text).await()
-        } catch (_: Exception) {
-            text
-        }
-        return@withContext translated
-    }
-
-    /**
-     * Downloads and initializes the ML Kit translation model for [languageConfig].
-     *
-     * ML Kit's download Task does not expose intermediate progress, so this
-     * flow emits 0.0 at the start and 1.0 on successful completion.
-     * Throws on failure.
-     */
-    override fun prepareModel(languageConfig: LanguageConfig): Flow<Float> = flow {
-        emit(0f)
-        val success = ensureModel(languageConfig)
-        if (!success) throw IllegalStateException("Failed to prepare translation model for $languageConfig")
-        emit(1f)
-    }
-
-    override suspend fun ensureModel(languageConfig: LanguageConfig): Boolean {
-        val src = TranslateLanguage.fromLanguageTag(languageConfig.source)
-        val tgt = TranslateLanguage.fromLanguageTag(languageConfig.target)
-
-        if (src == null || tgt == null) {
-            return false
-        }
-
-        val options = TranslatorOptions.Builder()
-            .setSourceLanguage(src)
-            .setTargetLanguage(tgt)
-            .build()
-        translator = Translation.getClient(options)
-        val conditions = DownloadConditions.Builder().build()
+    override suspend fun translate(text: String): String {
+        val translator = activeTranslator
+            ?: throw IllegalStateException("Translator not prepared. Call prepareModel first.")
 
         return try {
-            translator.downloadModelIfNeeded(conditions).await()
-            modelLoaded = true
-            true
-        } catch (_: Exception) {
-            modelLoaded = false
-            false
+            val result = translator.translate(text).await()
+            Log.d("MLKitTranslator", "Translation successful from $text: $result")
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "Translation failed", e)
+            throw e
         }
+    }
+
+    override fun prepareModel(languageConfig: LanguageConfig): Flow<ModelPrepState> = flow {
+        try {
+            emit(ModelPrepState.Checking)
+
+            val sourceTag = TranslateLanguage.fromLanguageTag(languageConfig.source)
+            val targetTag = TranslateLanguage.fromLanguageTag(languageConfig.target)
+
+            if (sourceTag == null || targetTag == null) {
+                throw IllegalArgumentException("Invalid language codes provided.")
+            }
+
+            val options = TranslatorOptions.Builder()
+                .setSourceLanguage(sourceTag)
+                .setTargetLanguage(targetTag)
+                .build()
+
+            // Close any previously active translator to free up memory
+            activeTranslator?.close()
+            activeTranslator = Translation.getClient(options)
+
+            val conditions = DownloadConditions.Builder()
+                .build()
+
+            emit(ModelPrepState.Preparing(progress = 0f))
+
+            activeTranslator?.downloadModelIfNeeded(conditions)?.await()
+
+            emit(ModelPrepState.Ready)
+
+        } catch (e: Exception) {
+            emit(ModelPrepState.Error(e))
+        }
+    }
+
+    override fun release() {
+        activeTranslator?.close()
+        activeTranslator = null
+    }
+
+    companion object {
+        private val TAG = MlKitTranslator::class.simpleName
     }
 }

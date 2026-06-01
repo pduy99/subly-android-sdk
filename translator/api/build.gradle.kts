@@ -23,7 +23,7 @@ android {
 }
 
 dependencies {
-    implementation(projects.core.model)
+    api(projects.core.model)
 
     api(libs.kotlinx.coroutines.core)
     testImplementation(libs.junit)

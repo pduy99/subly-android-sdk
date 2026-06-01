@@ -24,6 +24,9 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DGGML_OPENMP=OFF",
                     "-DGGML_LLAMAFILE=OFF",
+                    "-DGGML_USE_CPU=ON",
+                    "-DGGML_NEON=ON",             
+                    "-DCMAKE_BUILD_TYPE=Release"
                 )
             }
         }
@@ -49,8 +52,8 @@ android {
 }
 
 dependencies {
-    implementation(projects.asr.api)
-    implementation(projects.core.model)
+    api(projects.asr.api)
+    implementation(projects.core.downloader)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)

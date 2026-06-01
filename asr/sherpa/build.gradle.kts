@@ -31,9 +31,7 @@ android {
 dependencies {
     compileOnly(fileTree("libs") { include("*.aar") })
 
-    implementation(projects.asr.api)
-    implementation(projects.core.model)
-
+    api(projects.asr.api)
     implementation(libs.kotlinx.coroutines.play.services)
     implementation(libs.litert.lm)
     implementation(libs.mlkit.text.recognition)

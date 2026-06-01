@@ -36,11 +36,9 @@ dependencies {
     api(projects.core.model)
     implementation(projects.core.data)
     implementation(projects.asr.api)
-    implementation(projects.asr.whisper)
     implementation(projects.audio.api)
     implementation(projects.translator.api)
     implementation(projects.audio.impl)
-    implementation(projects.translator.mlkit)
 
     implementation(libs.okhttp)
     testImplementation(libs.junit)

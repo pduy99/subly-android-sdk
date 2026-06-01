@@ -2,17 +2,18 @@ package com.helios.subly.asr.sherpa
 
 import android.content.Context
 import android.util.Log
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.transform
-import java.util.concurrent.atomic.AtomicReference
-import com.helios.subly.asr.api.AsrDataSource
+import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.core.model.AsrResult
 import com.helios.subly.core.model.AudioFrame
 import com.helios.subly.core.model.LanguageConfig
-import com.helios.subly.core.model.TranslationPacket
+import com.helios.subly.core.model.ModelPrepState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.transform
+import java.util.concurrent.atomic.AtomicReference
 
 
 class SherpaOnnxTranscriber internal constructor(
@@ -20,7 +21,7 @@ class SherpaOnnxTranscriber internal constructor(
     private val model: SherpaOnnxModel,
     private val backend: SherpaOnnxBackend,
     private val modelLoaderFactory: SherpaOnnxModelLoaderFactory,
-) : AsrDataSource {
+) : SublyAsr {
 
     constructor(context: Context) : this(
         context = context,
@@ -41,7 +42,7 @@ class SherpaOnnxTranscriber internal constructor(
 
     override fun transcribe(
         frames: Flow<AudioFrame>
-    ): Flow<TranslationPacket> {
+    ): Flow<AsrResult> {
         if (!backend.isAvailable()) {
             Log.d(TAG, "sherpa-onnx backend not available; draining audio.")
             return frames.transform { /* drain, preserve backpressure */ }
@@ -78,16 +79,7 @@ class SherpaOnnxTranscriber internal constructor(
                 if (result.isEndpoint) {
                     if (text.isNotEmpty()) {
                         Log.d(TAG, "Emitted final packet text='$text'")
-                        emit(
-                            TranslationPacket(
-                                text = text,
-                                sourceLanguageCode = "en",
-                                targetLanguageCode = null,
-                                timestampMs = utteranceStartMs,
-                                source = TranslationPacket.Source.AUDIO,
-                                isFinal = true,
-                            ),
-                        )
+                        emit(AsrResult.Final(text))
                     }
                     synchronized(nativeLock) { handleRef.get()?.let(backend::reset) }
                     lastEmittedText = ""
@@ -107,16 +99,7 @@ class SherpaOnnxTranscriber internal constructor(
                     lastEmittedText = text
                     lastPartialEmitMs = now
                     Log.d(TAG, "Emitted partial packet text='$text'")
-                    emit(
-                        TranslationPacket(
-                            text = text,
-                            sourceLanguageCode = "en",
-                            targetLanguageCode = null,
-                            timestampMs = utteranceStartMs,
-                            source = TranslationPacket.Source.AUDIO,
-                            isFinal = false,
-                        ),
-                    )
+                    emit(AsrResult.Partial(text))
                 }
             }
             .flowOn(Dispatchers.Default)
@@ -127,9 +110,9 @@ class SherpaOnnxTranscriber internal constructor(
      * native backend. Emits extraction progress [0.0, 0.9] during the copy
      * phase and 1.0 once the native context is ready.
      */
-    override fun prepareModel(languageConfig: LanguageConfig): Flow<Float> = flow {
+    override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
         if (handleRef.get() != null) {
-            emit(1f)
+            emit(ModelPrepState.Ready)
             return@flow
         }
 
@@ -137,7 +120,7 @@ class SherpaOnnxTranscriber internal constructor(
 
         // Extraction phase: 0% -> 90%
         loader.extractWithProgress(model)
-            .onEach { extractProgress -> emit(extractProgress * 0.9f) }
+            .onEach { extractProgress -> emit(ModelPrepState.Preparing(extractProgress * 0.9f)) }
             .collect {}
 
         // Abort if extraction produced no files (missing assets / download not yet complete).
@@ -145,14 +128,14 @@ class SherpaOnnxTranscriber internal constructor(
         if (!loader.isReady(model)) return@flow
 
         val modelDir = loader.downloadTarget(model).absolutePath
-        emit(0.9f)
+        emit(ModelPrepState.Preparing(0.9f))
 
         // Native init phase: 90% -> 100%
         val created = backend.init(modelDir, model.sampleRateHz) ?: return@flow
         if (!handleRef.compareAndSet(null, created)) {
             runCatching { backend.release(created) }
         }
-        emit(1f)
+        emit(ModelPrepState.Ready)
     }.flowOn(Dispatchers.IO)
 
     override fun release() {

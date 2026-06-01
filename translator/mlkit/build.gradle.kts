@@ -23,8 +23,7 @@ android {
 }
 
 dependencies {
-    implementation(projects.translator.api)
-    implementation(projects.core.model)
+    api(projects.translator.api)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)

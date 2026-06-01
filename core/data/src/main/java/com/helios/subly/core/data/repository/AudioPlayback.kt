@@ -1,0 +1,102 @@
+package com.helios.subly.core.data.repository
+
+import android.media.projection.MediaProjection
+import android.util.Log
+import com.helios.subly.audio.api.AudioCaptureDataSource
+import com.helios.subly.core.model.Amplitude
+import com.helios.subly.core.model.AudioFrame
+import com.helios.subly.core.model.PcmAmplitude
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.isActive
+import kotlin.coroutines.CoroutineContext
+import kotlin.time.ExperimentalTime
+import kotlin.time.TimeSource
+
+/**
+ * [AudioCapture] backed by a pluggable [com.helios.subly.core.asr.audio.AudioCaptureDataSource].
+ *
+ * The platform-specific recorder lifecycle (`AudioRecord` open/read/close)
+ * lives behind [dataSource]; this class only:
+ * - shapes raw PCM reads into [com.helios.subly.core.model.AudioFrame]s,
+ * - tees per-frame amplitudes through a `SharedFlow` so the silence detector
+ *   can subscribe without re-opening capture,
+ * - manages Flow cancellation and idempotent teardown.
+ *
+ * Keeping the repository framework-free is the dependency-direction win: it
+ * can be unit-tested with a fake data source that yields canned PCM, and the
+ * data source can be swapped (Oboe/AAudio, captured-file source for QA)
+ * without touching this orchestration.
+ */
+@OptIn(ExperimentalTime::class)
+class AudioPlayback(
+    private val dataSource: AudioCaptureDataSource,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
+    private val ioContext: CoroutineContext = Dispatchers.IO,
+) : AudioCapture {
+
+    private val amplitudeFlow = MutableSharedFlow<Amplitude>(
+        replay = 0,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    override fun frames(mediaProjection: MediaProjection): Flow<AudioFrame> = flow {
+        runCatching { dataSource.open(mediaProjection) }
+            .onFailure {
+                throw it
+            }
+        // Session-relative monotonic origin. Timestamps are deltas-from-open, which is what the
+        // silence detector (and any downstream caption alignment) actually needs
+        val sessionStart = timeSource.markNow()
+        var totalReads = 0
+        var nonSilentReads = 0
+        var lastLogMs = 0L
+        try {
+            val buffer = ShortArray(dataSource.framesPerRead)
+            while (currentCoroutineContext().isActive) {
+                val read = dataSource.read(buffer)
+                if (read == AudioCaptureDataSource.Companion.READ_STOPPED) {
+                    break
+                }
+                if (read <= 0) {
+                    continue
+                } // transient (ERROR_BAD_VALUE etc.) - skip
+                val pcm = if (read == buffer.size) buffer.copyOf() else buffer.copyOf(read)
+                val maxAbs = PcmAmplitude.maxAbsSample(pcm, read)
+                val ts = sessionStart.elapsedNow().inWholeMilliseconds
+                totalReads++
+                if (maxAbs > 0) nonSilentReads++
+                // Throttle to 1 log/sec; capture both silent vs non-silent so we can
+                // tell whether playback-capture is returning real PCM or zeros (DRM).
+                if (ts - lastLogMs >= 1000L) {
+                    lastLogMs = ts
+                }
+                amplitudeFlow.tryEmit(Amplitude(maxAbs, ts))
+                emit(
+                    AudioFrame(
+                        pcm = pcm,
+                        sampleRateHz = dataSource.sampleRateHz,
+                        channelCount = dataSource.channelCount,
+                        timestampMs = ts,
+                        maxAbsSample = maxAbs,
+                    ),
+                )
+            }
+        } finally {
+            dataSource.close()
+        }
+    }.flowOn(ioContext)
+
+    override fun amplitudes(): Flow<Amplitude> = amplitudeFlow.asSharedFlow()
+
+    override fun stop() {
+        dataSource.close()
+    }
+}

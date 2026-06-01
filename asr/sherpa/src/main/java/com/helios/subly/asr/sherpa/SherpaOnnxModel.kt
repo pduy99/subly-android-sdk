@@ -21,7 +21,7 @@ internal enum class SherpaOnnxModel(
 ) {
     /** ASR: English streaming Zipformer. */
     STREAMING_ZIPFORMER_EN(
-        dirName = "sherpa-onnx/sherpa-onnx-streaming-zipformer-en",
+        dirName = "sherpa-onnx-streaming-zipformer-en",
         kind = SherpaModelKind.ASR,
         assetPatterns = listOf(
             Regex("encoder-epoch-99-avg-1.onnx"),
@@ -34,7 +34,7 @@ internal enum class SherpaOnnxModel(
 
     /** Punctuation: English online punctuation model. */
     PUNCTUATION_EN(
-        dirName = "sherpa-onnx/sherpa-onnx-online-punct-en",
+        dirName = "sherpa-onnx-online-punct-en",
         kind = SherpaModelKind.PUNCTUATION,
         assetPatterns = listOf(
             Regex("model.*\\.onnx"),

@@ -1,44 +1,66 @@
 cmake_minimum_required(VERSION 3.22.1)
-project("whisper_jni")
+project("whisper_android")
 
 set(CMAKE_CXX_STANDARD 17)
 
-# Path to the cloned whisper.cpp source tree (sibling of src/main/cpp).
-set(WHISPER_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../whisper.cpp)
-
-if (NOT EXISTS ${WHISPER_LIB_DIR}/src/whisper.cpp)
-    message(FATAL_ERROR "whisper.cpp source not found at ${WHISPER_LIB_DIR}. "
-            "Clone https://github.com/ggerganov/whisper.cpp into asr/whisper/whisper.cpp.")
-endif ()
-
-# Build ggml as a sub-project so it brings in its own backend sources and
-# defines (avoids having to enumerate every ggml-*.c file by hand).
-add_subdirectory(${WHISPER_LIB_DIR}/ggml ggml-build EXCLUDE_FROM_ALL)
-
-add_library(${PROJECT_NAME} SHARED
-        native-lib.cpp
-        ${WHISPER_LIB_DIR}/src/whisper.cpp
+# 1. Include paths for compiling the whisper_jni target
+include_directories(
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
 )
 
-target_compile_definitions(${PROJECT_NAME} PUBLIC GGML_USE_CPU)
-target_compile_definitions(${PROJECT_NAME} PRIVATE WHISPER_VERSION="1.x-subly")
+# 2. Build the 'ggml' target via its official subdirectory.
+add_subdirectory(ggml)
 
-target_include_directories(${PROJECT_NAME} PRIVATE
-        ${WHISPER_LIB_DIR}
-        ${WHISPER_LIB_DIR}/src
-        ${WHISPER_LIB_DIR}/include
-        ${WHISPER_LIB_DIR}/ggml/include
-        ${WHISPER_LIB_DIR}/ggml/src
+# 3. Build your Kotlin JNI bridge and the core whisper logic.
+add_library(
+        whisper_jni
+        SHARED
+        whisper-jni.cpp
+        whisper.cpp
 )
 
+# 4. Apply required macro definitions
+target_compile_definitions(whisper_jni PUBLIC GGML_USE_CPU)
+target_compile_definitions(whisper_jni PRIVATE WHISPER_VERSION="unknown")
+
+# 5. HARDWARE ACCELERATION INJECTION
+# This explicitly forces NEON and FP16 on both your library AND the underlying ggml library.
 if (${ANDROID_ABI} STREQUAL "arm64-v8a")
-    target_compile_options(${PROJECT_NAME} PRIVATE -march=armv8.2-a+fp16)
+    # Apply to your JNI code
+    target_compile_options(whisper_jni PRIVATE -march=armv8.2-a+fp16)
+
+    # CRITICAL FIX: Force hardware acceleration into the separately compiled ggml targets!
+    if (TARGET ggml)
+        target_compile_options(ggml PRIVATE -march=armv8.2-a+fp16)
+        target_compile_definitions(ggml PRIVATE GGML_USE_NEON)
+    endif()
 endif ()
 
+# 6. Heavy optimizations for non-debug/Release builds
 if (NOT ${CMAKE_BUILD_TYPE} STREQUAL "Debug")
-    target_compile_options(${PROJECT_NAME} PRIVATE -O3 -ffunction-sections -fdata-sections)
-    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--gc-sections)
+    set(RELEASE_OPTS
+            -O3
+            -fvisibility=hidden
+            -fvisibility-inlines-hidden
+            -ffunction-sections
+            -fdata-sections
+    )
+    target_compile_options(whisper_jni PRIVATE ${RELEASE_OPTS})
+    if (TARGET ggml)
+        target_compile_options(ggml PRIVATE ${RELEASE_OPTS})
+    endif()
+
+    target_link_options(whisper_jni PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -flto)
 endif ()
 
+# 7. Find Android Logging library
 find_library(log-lib log)
-target_link_libraries(${PROJECT_NAME} ${log-lib} android ggml)
+
+# 8. Link everything together
+target_link_libraries(
+        whisper_jni
+        ggml
+        ${log-lib}
+)
