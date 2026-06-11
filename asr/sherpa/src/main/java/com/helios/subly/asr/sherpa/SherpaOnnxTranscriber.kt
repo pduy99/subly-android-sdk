@@ -15,7 +15,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.transform
 import java.util.concurrent.atomic.AtomicReference
 
-
 class SherpaOnnxTranscriber internal constructor(
     private val context: Context,
     private val model: SherpaOnnxModel,
@@ -43,14 +42,15 @@ class SherpaOnnxTranscriber internal constructor(
     override fun transcribe(
         frames: Flow<AudioFrame>
     ): Flow<AsrResult> {
-        if (!backend.isAvailable()) {
-            Log.d(TAG, "sherpa-onnx backend not available; draining audio.")
-            return frames.transform { /* drain, preserve backpressure */ }
-        }
-
-        if (handleRef.get() == null) {
-            Log.d(TAG, "sherpa-onnx handle not available; draining audio.")
-            return frames.transform { /* drain */ }
+        // Per the SublyAsr contract: fail loudly on collection rather than
+        // silently draining audio (which presents to the user as "ready but
+        // no captions ever appear").
+        if (!backend.isAvailable() || handleRef.get() == null) {
+            return flow {
+                throw IllegalStateException(
+                    "Sherpa engine not prepared. Collect prepareModel() to Ready before transcribe()."
+                )
+            }
         }
 
         // Per-collection state: the previous emitted text (to dedupe
@@ -78,7 +78,8 @@ class SherpaOnnxTranscriber internal constructor(
 
                 if (result.isEndpoint) {
                     if (text.isNotEmpty()) {
-                        Log.d(TAG, "Emitted final packet text='$text'")
+                        // NOTE: never log transcript content — it is end-user speech.
+                        Log.d(TAG, "Emitted final packet (length=${text.length})")
                         emit(AsrResult.Final(text))
                     }
                     synchronized(nativeLock) { handleRef.get()?.let(backend::reset) }
@@ -98,7 +99,7 @@ class SherpaOnnxTranscriber internal constructor(
                 if (text.isNotEmpty() && grew && dueByTime) {
                     lastEmittedText = text
                     lastPartialEmitMs = now
-                    Log.d(TAG, "Emitted partial packet text='$text'")
+                    Log.d(TAG, "Emitted partial packet (length=${text.length})")
                     emit(AsrResult.Partial(text))
                 }
             }
@@ -109,8 +110,23 @@ class SherpaOnnxTranscriber internal constructor(
      * Extracts the model from APK assets (if needed) then initializes the
      * native backend. Emits extraction progress [0.0, 0.9] during the copy
      * phase and 1.0 once the native context is ready.
+     *
+     * Per the [ModelPrepState] contract, every exit path emits a terminal
+     * [ModelPrepState.Ready] or [ModelPrepState.Error] — never a silent
+     * completion.
      */
     override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
+        emit(ModelPrepState.Checking)
+
+        if (!backend.isAvailable()) {
+            emit(
+                ModelPrepState.Error(
+                    IllegalStateException("sherpa-onnx native backend is not available on this device/ABI.")
+                )
+            )
+            return@flow
+        }
+
         if (handleRef.get() != null) {
             emit(ModelPrepState.Ready)
             return@flow
@@ -123,15 +139,34 @@ class SherpaOnnxTranscriber internal constructor(
             .onEach { extractProgress -> emit(ModelPrepState.Preparing(extractProgress * 0.9f)) }
             .collect {}
 
-        // Abort if extraction produced no files (missing assets / download not yet complete).
-        // Proceeding with an empty modelDir would cause a native SIGSEGV inside createStream().
-        if (!loader.isReady(model)) return@flow
+        // Previously these two failure paths completed the flow silently,
+        // which the session interpreted as success ("false Ready").
+        if (!loader.isReady(model)) {
+            emit(
+                ModelPrepState.Error(
+                    IllegalStateException(
+                        "Model extraction completed but no model files were found for ${model::class.simpleName}. " +
+                                "Check that the model assets are bundled or the download finished."
+                    )
+                )
+            )
+            return@flow
+        }
 
         val modelDir = loader.downloadTarget(model).absolutePath
         emit(ModelPrepState.Preparing(0.9f))
 
         // Native init phase: 90% -> 100%
-        val created = backend.init(modelDir, model.sampleRateHz) ?: return@flow
+        val created = backend.init(modelDir, model.sampleRateHz)
+        if (created == null) {
+            emit(
+                ModelPrepState.Error(
+                    IllegalStateException("sherpa-onnx native init failed for model dir: $modelDir")
+                )
+            )
+            return@flow
+        }
+
         if (!handleRef.compareAndSet(null, created)) {
             runCatching { backend.release(created) }
         }
@@ -143,6 +178,8 @@ class SherpaOnnxTranscriber internal constructor(
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
         }
     }
+
+    override fun supportedLanguages(): List<String> = listOf("en")
 
     /**
      * Convert an int16 stereo/mono [AudioFrame] to the mono float PCM the
@@ -222,7 +259,7 @@ class SherpaOnnxTranscriber internal constructor(
     }
 
     private companion object {
-        const val TAG = "DUY"
+        const val TAG = "SherpaOnnxTranscriber"
 
         /** Min wall-clock gap between two partial emissions for the same utterance. */
         const val PARTIAL_MIN_INTERVAL_MS = 200L

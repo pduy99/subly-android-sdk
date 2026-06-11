@@ -1,4 +1,4 @@
-package com.helios.subly.core.data.repository
+package com.helios.subly.audio.api
 
 import android.media.projection.MediaProjection
 import com.helios.subly.core.model.Amplitude

@@ -1,7 +1,7 @@
-package com.helios.subly.core.data.repository
+package com.helios.subly.audio.impl
 
 import android.media.projection.MediaProjection
-import android.util.Log
+import com.helios.subly.audio.api.AudioCapture
 import com.helios.subly.audio.api.AudioCaptureDataSource
 import com.helios.subly.core.model.Amplitude
 import com.helios.subly.core.model.AudioFrame
@@ -62,7 +62,7 @@ class AudioPlayback(
             val buffer = ShortArray(dataSource.framesPerRead)
             while (currentCoroutineContext().isActive) {
                 val read = dataSource.read(buffer)
-                if (read == AudioCaptureDataSource.Companion.READ_STOPPED) {
+                if (read == AudioCaptureDataSource.READ_STOPPED) {
                     break
                 }
                 if (read <= 0) {

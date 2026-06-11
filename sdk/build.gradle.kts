@@ -34,7 +34,6 @@ dependencies {
     implementation(libs.kotlinx.coroutines.play.services)
 
     api(projects.core.model)
-    implementation(projects.core.data)
     implementation(projects.asr.api)
     implementation(projects.audio.api)
     implementation(projects.translator.api)

@@ -22,6 +22,8 @@ android {
 dependencies {
     api(projects.audio.api)
 
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
     testImplementation(libs.junit)
 }
