@@ -12,24 +12,56 @@ System audio ──▶ Capture ──▶ ASR engine ──▶ Sentence assembly 
 
 ## Requirements
 
-- `minSdk` 29 (`AudioPlaybackCapture` requires Android 10+)
+- `minSdk` 34
+- arm64-v8a device — the native ASR libraries ship 64-bit ARM binaries only
 - A `MediaProjection` token obtained by your app (see [Permissions](#permissions))
 - Kotlin coroutines — the entire public API is `Flow`-based
 
 ## Installation
 
+The SDK is not published to a Maven repository yet. Consume it as a [Gradle composite build](https://docs.gradle.org/current/userguide/composite_builds.html):
+
+**1. Clone the repo** (e.g. next to your app project):
+
+```bash
+git clone https://github.com/pduy99/subly-android-sdk.git
+```
+
+**2. Include the build** in your app's `settings.gradle.kts`:
+
 ```kotlin
-dependencies {
-    implementation("com.helios.subly:sdk:<version>")
-
-    // Pick at least one ASR engine:
-    implementation("com.helios.subly:asr-sherpa:<version>")   // streaming, partial results
-    implementation("com.helios.subly:asr-whisper:<version>")  // chunked, higher accuracy
-
-    // Translator:
-    implementation("com.helios.subly:translator-mlkit:<version>")
+includeBuild("../subly-android-sdk") {
+    dependencySubstitution {
+        substitute(module("com.helios.subly.sdk:core")).using(project(":sdk"))
+        substitute(module("com.helios.subly.asr:sherpa-onnx")).using(project(":asr:sherpa"))
+        substitute(module("com.helios.subly.asr:whisper")).using(project(":asr:whisper"))
+        substitute(module("com.helios.subly.translator:mlkit")).using(project(":translator:mlkit"))
+    }
 }
 ```
+
+**3. Declare the dependencies** — Gradle substitutes them with the included build:
+
+```kotlin
+dependencies {
+    implementation("com.helios.subly.sdk:core:0.0.1")
+
+    // Pick at least one ASR engine:
+    implementation("com.helios.subly.asr:sherpa-onnx:0.0.1") // streaming, partial results
+    implementation("com.helios.subly.asr:whisper:0.0.1")     // chunked, higher accuracy
+
+    // Translator:
+    implementation("com.helios.subly.translator:mlkit:0.0.1")
+}
+```
+
+> **Using the sherpa engine?** `:asr:sherpa` compiles against the bundled `asr/sherpa/libs/sherpa-onnx-1.13.2.aar` as `compileOnly` (AGP doesn't allow local AARs as `implementation` inside library modules). Your **app** module must add the same AAR to its runtime classpath:
+>
+> ```kotlin
+> implementation(files("../subly-android-sdk/asr/sherpa/libs/sherpa-onnx-1.13.2.aar"))
+> ```
+
+Building the whisper engine requires the Android NDK and CMake 3.22+ (whisper.cpp is compiled from vendored sources).
 
 ---
 
@@ -137,7 +169,7 @@ Note: both engines emit partials + finals. Sherpa partials arrive at ~200 ms cad
 | Partial results | ✅ ~200 ms cadence | ✅ ~800 ms cadence (growing-window re-transcription) |
 | Perceived latency | Lower | Low-moderate (first partial ≥ ~1.3 s into an utterance) |
 | Accuracy | Good | Better, esp. noisy audio / accents |
-| Model delivery | Bundled in APK assets | Downloaded on first prepare (~57 MB q5_1, Hugging Face) |
+| Model delivery | Provided by your app: bundle under `assets/sherpa-onnx/<model>/` or download into app storage | Downloaded on first prepare (~57 MB q5_1, Hugging Face) |
 | Best for | Live conversation feel | Accuracy-first captioning |
 
 Both implement `SublyAsr`, so switching is a one-line change in the builder. If you let users toggle engines at runtime, rebuild `Subly` with the other factory and create a new session.
