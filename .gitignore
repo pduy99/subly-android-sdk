@@ -61,7 +61,9 @@ compile_commands.json
 *.safetensors
 **/models/*.zip
 **/assets/models/
-libs/
+
+# Local AAR dependencies ARE tracked (e.g. asr/sherpa/libs/sherpa-onnx-*.aar) —
+# required for the project to build from a fresh clone.
 
 # ----- ML Kit runtime caches -----
 **/mlkit_*/
