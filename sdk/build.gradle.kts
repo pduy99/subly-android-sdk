@@ -16,15 +16,6 @@ android {
     defaultConfig {
         minSdk = 34
         consumerProguardFiles("consumer-rules.pro")
-
-        // arm64-v8a only: minSdk 34 devices are universally 64-bit ARM
-        ndk {
-            abiFilters += "arm64-v8a"
-        }
-    }
-
-    aaptOptions {
-        noCompress.addAll(listOf("ort", "txt"))
     }
 
     compileOptions {
@@ -38,19 +29,17 @@ android {
 }
 
 dependencies {
-    // sherpa-onnx is `compileOnly` because AGP refuses to bundle a local
-    // .aar inside another .aar (this module is `com.android.library`, so
-    // its build output is itself an AAR). The Consumer app re-declares the
-    // same .aar as `implementation(files(...))` so the final APK actually
-    // packages sherpa-onnx classes + `libsherpa-onnx-jni.so`. Without that
-    // app-side declaration, [SherpaOnnxBackend.Jni.isAvailable] returns
-    // false at runtime and [SherpaOnnxTranscriber] drains.
-    compileOnly(fileTree("libs") { include("*.aar") })
-
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.onnxruntime.android)
-    implementation(libs.mlkit.text.recognition)
+    implementation(libs.kotlinx.coroutines.play.services)
+
+    api(projects.core.model)
+    implementation(projects.asr.api)
+    implementation(projects.audio.api)
+    implementation(projects.translator.api)
+    implementation(projects.audio.impl)
+
+    implementation(libs.okhttp)
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.mockito.core)

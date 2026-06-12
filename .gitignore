@@ -83,6 +83,7 @@ secrets.properties
 api-keys.properties
 google-services.json
 firebase-credentials.json
+.firebender
 
 # ----- OS metadata -----
 .DS_Store
