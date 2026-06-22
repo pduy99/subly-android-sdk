@@ -3,6 +3,8 @@ package com.helios.subly.asr.sherpa
 import android.content.Context
 import android.util.Log
 import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.core.downloader.ModelDownloader
+import com.helios.subly.core.downloader.OkHttpModelDownloader
 import com.helios.subly.core.model.AsrResult
 import com.helios.subly.core.model.AudioFrame
 import com.helios.subly.core.model.LanguageConfig
@@ -22,15 +24,32 @@ class SherpaOnnxTranscriber internal constructor(
     private val modelLoaderFactory: SherpaOnnxModelLoaderFactory,
 ) : SublyAsr {
 
-    constructor(context: Context) : this(
+    /**
+     * @param modelDownloader downloader used to fetch model files on first
+     *   prepare. Defaults to a plain [OkHttpModelDownloader]; supply your own
+     *   (e.g. an OkHttp client with auth headers or certificate pinning, often
+     *   provided via Hilt) to control how models are fetched.
+     */
+    @JvmOverloads
+    constructor(
+        context: Context,
+        modelDownloader: ModelDownloader = OkHttpModelDownloader(),
+    ) : this(
         context = context,
         model = SherpaOnnxModel.Default,
         backend = SherpaOnnxBackend.Jni,
-        modelLoaderFactory = SherpaOnnxModelLoaderFactory.Default,
+        modelLoaderFactory = SherpaOnnxModelLoaderFactory.of(modelDownloader),
     )
 
     /** Lazily-initialized recognizer/stream pair. Cleared on [release]. */
     private val handleRef = AtomicReference<SherpaOnnxBackend.Handle?>(null)
+
+    /**
+     * Optional punctuation model, prepared best-effort alongside the ASR
+     * model. `null` means punctuation couldn't be provisioned — finals are
+     * then emitted verbatim (still correct, just unpunctuated).
+     */
+    private val punctuationRef = AtomicReference<SherpaOnnxPunctuation?>(null)
 
     /**
      * Serializes backend calls. Necessary because sherpa-onnx mutates the
@@ -78,9 +97,16 @@ class SherpaOnnxTranscriber internal constructor(
 
                 if (result.isEndpoint) {
                     if (text.isNotEmpty()) {
+                        // Restore casing/punctuation if the punctuation model
+                        // is available; otherwise emit the raw hypothesis.
+                        // Streaming Zipformer output is lowercase + unpunctuated,
+                        // and the SDK's sentence assembly keys off punctuation.
+                        val finalText = punctuationRef.get()?.let { p ->
+                            runCatching { p.punctuate(text) }.getOrDefault(text)
+                        } ?: text
                         // NOTE: never log transcript content — it is end-user speech.
-                        Log.d(TAG, "Emitted final packet (length=${text.length})")
-                        emit(AsrResult.Final(text))
+                        Log.d(TAG, "Emitted final packet (length=${finalText.length})")
+                        emit(AsrResult.Final(finalText))
                     }
                     synchronized(nativeLock) { handleRef.get()?.let(backend::reset) }
                     lastEmittedText = ""
@@ -134,19 +160,20 @@ class SherpaOnnxTranscriber internal constructor(
 
         val loader = modelLoaderFactory.create(context)
 
-        // Extraction phase: 0% -> 90%
-        loader.extractWithProgress(model)
-            .onEach { extractProgress -> emit(ModelPrepState.Preparing(extractProgress * 0.9f)) }
+        // ASR provisioning (on-disk / bundled assets / download): 0% -> 80%
+        loader.provisionWithProgress(model)
+            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.8f)) }
             .collect {}
 
-        // Previously these two failure paths completed the flow silently,
-        // which the session interpreted as success ("false Ready").
+        // A finished-but-not-ready provision means no source was available.
+        // Emit Error rather than completing silently (which the session would
+        // misread as a "false Ready").
         if (!loader.isReady(model)) {
             emit(
                 ModelPrepState.Error(
                     IllegalStateException(
-                        "Model extraction completed but no model files were found for ${model::class.simpleName}. " +
-                                "Check that the model assets are bundled or the download finished."
+                        "No model files found for ${model::class.simpleName}. " +
+                                "The download failed and no assets were bundled — check connectivity and retry."
                     )
                 )
             )
@@ -154,9 +181,9 @@ class SherpaOnnxTranscriber internal constructor(
         }
 
         val modelDir = loader.downloadTarget(model).absolutePath
-        emit(ModelPrepState.Preparing(0.9f))
+        emit(ModelPrepState.Preparing(0.85f))
 
-        // Native init phase: 90% -> 100%
+        // ASR native init.
         val created = backend.init(modelDir, model.sampleRateHz)
         if (created == null) {
             emit(
@@ -170,6 +197,23 @@ class SherpaOnnxTranscriber internal constructor(
         if (!handleRef.compareAndSet(null, created)) {
             runCatching { backend.release(created) }
         }
+
+        // Punctuation: best-effort. Failure to provision or init MUST NOT fail
+        // prepare — the engine still works, finals are just unpunctuated.
+        // Progress 85% -> 100% so a punct download is visible to the user.
+        runCatching {
+            loader.provisionWithProgress(SherpaOnnxModel.PUNCTUATION_EN)
+                .onEach { p -> emit(ModelPrepState.Preparing(0.85f + p * 0.15f)) }
+                .collect {}
+            if (loader.isReady(SherpaOnnxModel.PUNCTUATION_EN)) {
+                val punctDir = loader.downloadTarget(SherpaOnnxModel.PUNCTUATION_EN).absolutePath
+                punctuationRef.set(SherpaOnnxPunctuation(punctDir))
+                Log.i(TAG, "Punctuation model ready.")
+            } else {
+                Log.w(TAG, "Punctuation model unavailable; finals will be unpunctuated.")
+            }
+        }.onFailure { Log.w(TAG, "Punctuation prepare failed; continuing without it.", it) }
+
         emit(ModelPrepState.Ready)
     }.flowOn(Dispatchers.IO)
 
@@ -177,6 +221,7 @@ class SherpaOnnxTranscriber internal constructor(
         synchronized(nativeLock) {
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
         }
+        punctuationRef.getAndSet(null)?.let { runCatching { it.release() } }
     }
 
     override fun supportedLanguages(): List<String> = listOf("en")

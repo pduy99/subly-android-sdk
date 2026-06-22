@@ -53,7 +53,9 @@ android {
 
 dependencies {
     api(projects.asr.api)
-    implementation(projects.core.downloader)
+    // api (not implementation): ModelDownloader appears in WhisperTranscriber's
+    // public constructor, so it must be visible to consumers of this module.
+    api(projects.core.downloader)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)

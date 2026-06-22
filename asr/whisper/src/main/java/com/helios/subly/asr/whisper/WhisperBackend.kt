@@ -6,8 +6,18 @@ package com.helios.subly.asr.whisper
  */
 interface WhisperBackend {
     fun isAvailable(): Boolean
-    fun init(modelPath: String, targetLanguageCode: String): Long
-    fun transcribe(handle: Long, pcm: FloatArray, sampleRateHz: Int): String
+
+    /**
+     * @param vadModelPath ggml Silero VAD model path; empty disables the
+     *   pre-transcribe speech gate.
+     */
+    fun init(modelPath: String, targetLanguageCode: String, vadModelPath: String): Long
+
+    /**
+     * @param gateWithVad run the Silero VAD gate before decoding. Pass `true`
+     *   for final windows, `false` for partials (skips the full-window scan).
+     */
+    fun transcribe(handle: Long, pcm: FloatArray, sampleRateHz: Int, gateWithVad: Boolean): String
 
     /**
      * BCP-47 language detected by whisper on the most recent [transcribe]
@@ -20,10 +30,10 @@ interface WhisperBackend {
     companion object {
         val Jni: WhisperBackend = object : WhisperBackend {
             override fun isAvailable() = WhisperNative.isAvailable()
-            override fun init(modelPath: String, targetLanguageCode: String) =
-                WhisperNative.nativeInit(modelPath, targetLanguageCode)
-            override fun transcribe(handle: Long, pcm: FloatArray, sampleRateHz: Int) =
-                WhisperNative.nativeTranscribe(handle, pcm, sampleRateHz)
+            override fun init(modelPath: String, targetLanguageCode: String, vadModelPath: String) =
+                WhisperNative.nativeInit(modelPath, targetLanguageCode, vadModelPath)
+            override fun transcribe(handle: Long, pcm: FloatArray, sampleRateHz: Int, gateWithVad: Boolean) =
+                WhisperNative.nativeTranscribe(handle, pcm, sampleRateHz, gateWithVad)
             override fun lastDetectedLang(handle: Long) =
                 WhisperNative.nativeLastDetectedLang(handle)
             override fun release(handle: Long) = WhisperNative.nativeRelease(handle)

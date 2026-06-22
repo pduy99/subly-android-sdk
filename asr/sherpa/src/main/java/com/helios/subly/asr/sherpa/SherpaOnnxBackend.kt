@@ -1,8 +1,9 @@
 package com.helios.subly.asr.sherpa
 
 import android.util.Log
-import com.helios.subly.asr.sherpa.JniSherpaOnnxBackend.isAvailable
+import java.io.File
 import com.k2fsa.sherpa.onnx.EndpointConfig
+import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OnlineCtcFstDecoderConfig
 import com.k2fsa.sherpa.onnx.OnlineLMConfig
@@ -87,7 +88,22 @@ internal interface SherpaOnnxBackend {
  */
 private object JniSherpaOnnxBackend : SherpaOnnxBackend {
 
-    private const val TAG = "DUY"
+    private const val TAG = "SherpaOnnxBackend"
+
+    /**
+     * Picks the first file in [dir] whose name matches [prefix]*.onnx,
+     * preferring an int8 build when both are present. Returns `null` if none
+     * match — lets [init] fail loudly with a clear message instead of handing
+     * sherpa-onnx a non-existent path.
+     */
+    private fun resolveOnnx(dir: File, prefix: String): String? {
+        val candidates = dir.listFiles { f ->
+            f.isFile && f.name.startsWith(prefix) && f.name.endsWith(".onnx")
+        }?.toList().orEmpty()
+        if (candidates.isEmpty()) return null
+        return (candidates.firstOrNull { it.name.contains(".int8.") } ?: candidates.first())
+            .absolutePath
+    }
 
     /**
      * Touching any sherpa-onnx class triggers the static initializer that
@@ -110,13 +126,25 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
 
     override fun init(modelDir: String, sampleRateHz: Int): SherpaOnnxBackend.Handle? {
         if (!available) return null
+        val dir = File(modelDir)
+        val encoder = resolveOnnx(dir, "encoder")
+        val decoder = resolveOnnx(dir, "decoder")
+        val joiner = resolveOnnx(dir, "joiner")
+        if (encoder == null || decoder == null || joiner == null) {
+            Log.w(
+                TAG,
+                "sherpa-onnx init: missing transducer files in $modelDir " +
+                        "(encoder=${encoder != null} decoder=${decoder != null} joiner=${joiner != null})"
+            )
+            return null
+        }
         return runCatching {
             val config = OnlineRecognizerConfig(
                 modelConfig = OnlineModelConfig(
                     transducer = OnlineTransducerModelConfig(
-                        encoder = "$modelDir/encoder-epoch-99-avg-1.onnx",
-                        decoder = "$modelDir/decoder-epoch-99-avg-1.onnx",
-                        joiner = "$modelDir/joiner-epoch-99-avg-1.onnx",
+                        encoder = encoder,
+                        decoder = decoder,
+                        joiner = joiner,
                     ),
                     tokens = "$modelDir/tokens.txt",
                     numThreads = 1,
@@ -128,7 +156,31 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
                     featureDim = 80,
                 ),
                 ctcFstDecoderConfig = OnlineCtcFstDecoderConfig(),
-                endpointConfig = EndpointConfig(),
+                // Endpoint tuning for captions: finalize on a short pause so
+                // each spoken sentence/clause becomes its own final quickly,
+                // instead of letting one utterance grow for 10-20 s (which
+                // made the live caption a giant reflowing block).
+                //  - rule1: long pure-silence guard (no speech yet).
+                //  - rule2: 0.8 s of trailing silence AFTER speech -> the main
+                //           driver of per-sentence finals.
+                //  - rule3: hard cap so a run-on never grows past ~10 s.
+                endpointConfig = EndpointConfig(
+                    rule1 = EndpointRule(
+                        mustContainNonSilence = false,
+                        minTrailingSilence = 2.0f,
+                        minUtteranceLength = 0f,
+                    ),
+                    rule2 = EndpointRule(
+                        mustContainNonSilence = true,
+                        minTrailingSilence = 0.8f,
+                        minUtteranceLength = 0f,
+                    ),
+                    rule3 = EndpointRule(
+                        mustContainNonSilence = false,
+                        minTrailingSilence = 0f,
+                        minUtteranceLength = 10f,
+                    ),
+                ),
                 enableEndpoint = true,
                 decodingMethod = "greedy_search",
                 maxActivePaths = 4,

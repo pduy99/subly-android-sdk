@@ -8,6 +8,7 @@
 #include <mutex>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #include "whisper.h"
 
@@ -24,7 +25,8 @@
 namespace {
 
     struct WhisperHandle {
-        whisper_context * ctx = nullptr;
+        whisper_context     * ctx = nullptr;
+        whisper_vad_context * vad = nullptr; // null => VAD gate disabled
         std::string target_lang;     // empty => auto-detect, then pinned below
         std::string pinned_lang;     // language pinned after first detection
         std::string last_detected;
@@ -100,10 +102,35 @@ namespace {
         return std::clamp(frames + 64, 192, 1500);
     }
 
-    // Windows whose whisper-computed no-speech probability exceeds this are
-    // dropped instead of transcribed (hallucination guard for noise/music
-    // that passed the amplitude VAD).
+    // ---- Non-speech rejection (music / noise hallucination guards) ----------
+    //
+    // Three layers, cheapest first:
+    //   1. Silero VAD gate (below): a neural speech detector run *before*
+    //      Whisper. The amplitude VAD upstream only knows "loud vs quiet" and
+    //      cannot tell speech from music — this can. Windows with no speech
+    //      frame above VAD_SPEECH_PROB are dropped without paying for a
+    //      Whisper decode at all.
+    //   2. no-speech probability: whisper's own per-segment estimate.
+    //   3. average token log-prob: confidence of the decoded text. Music/noise
+    //      hallucinations are typically low-confidence even when (1)/(2) let
+    //      them through.
+    // A window is dropped if the VAD finds no speech, OR whisper reports high
+    // no-speech probability, OR the decoded text is very low confidence.
+
+    // Max Silero per-frame speech probability below which a window is treated
+    // as non-speech and dropped before transcription. 0.5 is Silero's default
+    // speech threshold; raise toward 0.6-0.7 if music still leaks, lower if
+    // quiet/soft speech is being dropped.
+    constexpr float VAD_SPEECH_PROB = 0.50f;
+
+    // Whisper's own per-segment no-speech probability above which we drop.
     constexpr float NO_SPEECH_THRESHOLD = 0.60f;
+
+    // Average decoded-token log-probability below which a window is treated as
+    // a hallucination and dropped. Confident speech is typically > -0.7; music
+    // lyric/noise hallucinations commonly land in -1.2..-2.0. -1.0 is the
+    // OpenAI Whisper default; make it more negative if real speech is dropped.
+    constexpr float AVG_LOGPROB_THRESHOLD = -1.0f;
 
 } // namespace
 
@@ -118,10 +145,12 @@ JNIEXPORT jlong JNICALL
 Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
         JNIEnv * env, jobject /*thiz*/,
         jstring model_path_jstr,
-        jstring target_language_jstr) {
+        jstring target_language_jstr,
+        jstring vad_model_path_jstr) {
 
     std::string model_path = jstring_to_std(env, model_path_jstr);
     std::string target     = jstring_to_std(env, target_language_jstr);
+    std::string vad_path   = jstring_to_std(env, vad_model_path_jstr);
 
     if (model_path.empty()) {
         LOGE("nativeInit: empty model path");
@@ -172,11 +201,25 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
         LOGBENCH("warmup ms=%.0f", warmup_ms);
     }
 
+    // Optional Silero VAD gate. Non-fatal if it fails to load: we just fall
+    // back to the no-speech / log-prob guards inside nativeTranscribe.
+    whisper_vad_context * vad = nullptr;
+    if (!vad_path.empty()) {
+        whisper_vad_context_params vctx_params = whisper_vad_default_context_params();
+        vctx_params.n_threads = optimalThreadCount();
+        vctx_params.use_gpu   = false;
+        vad = whisper_vad_init_from_file_with_params(vad_path.c_str(), vctx_params);
+        if (!vad) {
+            LOGW("nativeInit: VAD init failed for %s (gate disabled)", vad_path.c_str());
+        }
+    }
+
     auto * handle = new WhisperHandle();
     handle->ctx = ctx;
+    handle->vad = vad;
     handle->target_lang = target;
-    LOGI("nativeInit: ctx=%p target='%s' threads=%d",
-            ctx, target.c_str(), optimalThreadCount());
+    LOGI("nativeInit: ctx=%p vad=%p target='%s' threads=%d",
+            ctx, vad, target.c_str(), optimalThreadCount());
     return reinterpret_cast<jlong>(handle);
 }
 
@@ -185,7 +228,8 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
         JNIEnv * env, jobject /*thiz*/,
         jlong handle_ptr,
         jfloatArray pcm_jarr,
-        jint /*sample_rate*/) {         // whisper.cpp always assumes 16 kHz internally
+        jint /*sample_rate*/,           // whisper.cpp always assumes 16 kHz internally
+        jboolean gate_with_vad) {       // run the Silero VAD gate (finals only; see Kotlin)
 
     auto * handle = reinterpret_cast<WhisperHandle *>(handle_ptr);
     if (!handle || !handle->ctx || !pcm_jarr) {
@@ -199,6 +243,43 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
 
     std::vector<float> pcmf32(n_samples);
     env->GetFloatArrayRegion(pcm_jarr, 0, n_samples, pcmf32.data());
+
+    const double audio_ms_in = (double) n_samples * 1000.0 / WHISPER_SAMPLE_RATE;
+
+    // Layer 1 — Silero VAD gate. Run the neural speech detector first; if no
+    // frame in this window looks like speech, drop it without paying for a
+    // Whisper decode. This is what rejects background music / noise that the
+    // upstream amplitude VAD (loud-vs-quiet only) can't distinguish.
+    //
+    // Only gated when gate_with_vad is set. Partial windows skip it: they grow
+    // every ~800 ms and re-scanning the whole (up to 5 s) window each time adds
+    // up to ~1 s of pure overhead on the hot path. Partials are disposable, so
+    // any non-speech that slips through is caught post-decode by the no-speech
+    // / log-prob guards below and never reaches a committed final anyway.
+    if (handle->vad && gate_with_vad) {
+        const auto t_vad = std::chrono::steady_clock::now();
+        // detect_speech resets LSTM state; correct here since each window is
+        // an independent (possibly growing) snapshot passed in full.
+        const bool ok = whisper_vad_detect_speech(
+                handle->vad, pcmf32.data(), (int) pcmf32.size());
+        float max_prob = 0.0f;
+        if (ok) {
+            const int   n_probs = whisper_vad_n_probs(handle->vad);
+            const float * probs = whisper_vad_probs(handle->vad);
+            for (int i = 0; i < n_probs && probs; ++i) {
+                if (probs[i] > max_prob) max_prob = probs[i];
+            }
+        }
+        const double vad_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_vad).count();
+        if (!ok || max_prob < VAD_SPEECH_PROB) {
+            LOGBENCH("vad_drop max_prob=%.2f audio_ms=%.0f vad_ms=%.1f",
+                     max_prob, audio_ms_in, vad_ms);
+            return env->NewStringUTF("");
+        }
+        LOGBENCH("vad_pass max_prob=%.2f audio_ms=%.0f vad_ms=%.1f",
+                 max_prob, audio_ms_in, vad_ms);
+    }
 
     whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     params.print_progress   = false;
@@ -287,17 +368,39 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
         }
     }
 
-    // Amplitude-based VAD upstream lets non-speech noise (music, hum)
-    // through, and whisper hallucinates captions for it. Whisper's own
-    // no-speech probability is a much better signal — drop the window
-    // instead of emitting garbage.
+    // Layers 2 & 3 — post-decode hallucination guards. Even when the VAD lets
+    // a window through (e.g. singing, speech-like noise), whisper's own
+    // no-speech probability and the confidence of the decoded text catch most
+    // of the remaining garbage. Drop on EITHER signal.
     {
         const int n_seg = whisper_full_n_segments(handle->ctx);
         if (n_seg > 0) {
             const float no_speech =
                     whisper_full_get_segment_no_speech_prob(handle->ctx, 0);
-            if (no_speech > NO_SPEECH_THRESHOLD) {
-                LOGBENCH("no_speech_drop prob=%.2f audio_ms=%.0f", no_speech, audio_ms);
+
+            // Mean token log-prob across all decoded segments. whisper exposes
+            // per-token *linear* probability; average its log.
+            double sum_logprob = 0.0;
+            int    n_tokens    = 0;
+            for (int s = 0; s < n_seg; ++s) {
+                const int nt = whisper_full_n_tokens(handle->ctx, s);
+                for (int t = 0; t < nt; ++t) {
+                    const float p = whisper_full_get_token_p(handle->ctx, s, t);
+                    sum_logprob += std::log((double) std::max(p, 1e-6f));
+                    n_tokens++;
+                }
+            }
+            const float avg_logprob =
+                    n_tokens > 0 ? (float) (sum_logprob / n_tokens) : 0.0f;
+
+            const bool drop_no_speech = no_speech > NO_SPEECH_THRESHOLD;
+            const bool drop_low_conf  =
+                    n_tokens > 0 && avg_logprob < AVG_LOGPROB_THRESHOLD;
+            if (drop_no_speech || drop_low_conf) {
+                LOGBENCH("no_speech_drop prob=%.2f avg_logprob=%.2f "
+                         "reason=%s audio_ms=%.0f",
+                         no_speech, avg_logprob,
+                         drop_no_speech ? "no_speech" : "low_conf", audio_ms);
                 return env->NewStringUTF("");
             }
         }
@@ -331,6 +434,10 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeRelease(
         JNIEnv * /*env*/, jobject /*thiz*/, jlong handle_ptr) {
     auto * handle = reinterpret_cast<WhisperHandle *>(handle_ptr);
     if (!handle) return;
+    if (handle->vad) {
+        whisper_vad_free(handle->vad);
+        handle->vad = nullptr;
+    }
     if (handle->ctx) {
         whisper_free(handle->ctx);
         handle->ctx = nullptr;

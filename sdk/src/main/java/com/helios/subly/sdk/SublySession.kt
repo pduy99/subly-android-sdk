@@ -325,20 +325,29 @@ class SublySession internal constructor(
 
     // ---- Partial handling -------------------------------------------------
     //
-    // Partials are throwaway hypotheses re-emitted every ~800 ms, so:
-    //  - translation is throttled (re-translate only when the text grew
-    //    meaningfully or enough time passed); otherwise the previous
-    //    translation is reused while the original text still updates;
-    //  - a translation failure degrades (previous translation, or untranslated
-    //    original) instead of killing the pipeline. Finals stay fail-loud.
+    // Partials are throwaway, ever-growing hypotheses. Re-translating the whole
+    // growing block on every tick is wasteful AND makes the caption reflow —
+    // NMT reorders earlier words as more context arrives, so text the reader
+    // already read keeps changing. To avoid that we split each partial into:
+    //   - a STABLE prefix: the completed sentences up to the last terminator,
+    //     translated once and cached until the prefix itself changes;
+    //   - a TAIL: the in-progress clause after the last terminator,
+    //     re-translated (throttled) as it grows.
+    // The emitted caption is prefixTranslation + tailTranslation, so already-
+    // spoken sentences stop shifting under the reader and only the live clause
+    // moves. A translation failure degrades to source text, never throws.
 
-    private var lastPartialOriginal = ""
-    private var lastPartialTranslation = ""
+    private var partialStablePrefix = ""
+    private var partialStablePrefixTranslation = ""
+    private var lastPartialTail = ""
+    private var lastPartialTailTranslation = ""
     private var lastPartialTranslatedAtNanos = 0L
 
     private fun resetPartialThrottle() {
-        lastPartialOriginal = ""
-        lastPartialTranslation = ""
+        partialStablePrefix = ""
+        partialStablePrefixTranslation = ""
+        lastPartialTail = ""
+        lastPartialTailTranslation = ""
         lastPartialTranslatedAtNanos = 0L
     }
 
@@ -351,24 +360,45 @@ class SublySession internal constructor(
 
         val tentativeSentence = "$pendingText $trimmed".trim()
 
-        val grewEnough =
-            tentativeSentence.length - lastPartialOriginal.length >= PARTIAL_RETRANSLATE_MIN_GROWTH
-        val agedEnough =
-            (System.nanoTime() - lastPartialTranslatedAtNanos) / 1_000_000 >= PARTIAL_RETRANSLATE_MIN_INTERVAL_MS
-        val shouldTranslate = lastPartialTranslation.isEmpty() || grewEnough || agedEnough
+        // Split at the last sentence terminator: everything before it is
+        // settled and won't change; only the tail is still in flux.
+        val splitAt = lastTerminatorEnd(tentativeSentence)
+        val prefix = tentativeSentence.substring(0, splitAt).trim()
+        val tail = tentativeSentence.substring(splitAt).trim()
 
-        val translation = if (shouldTranslate) {
-            translatePartial(tentativeSentence).also {
-                lastPartialOriginal = tentativeSentence
-                lastPartialTranslation = it
-                lastPartialTranslatedAtNanos = System.nanoTime()
-            }
-        } else {
-            BenchLog.metric(
-                "translate_skip kind=partial reason=throttle src_len=${tentativeSentence.length}"
-            )
-            lastPartialTranslation
+        // Stable prefix: translate once, re-translate only when it changes
+        // (i.e. a new sentence just completed). Cost is O(sentences), not
+        // O(partials).
+        if (prefix != partialStablePrefix) {
+            partialStablePrefixTranslation =
+                if (prefix.isEmpty()) "" else translatePartial(prefix)
+            partialStablePrefix = prefix
         }
+
+        // Tail: the only part re-translated per tick, and throttled.
+        if (tail.isEmpty()) {
+            lastPartialTail = ""
+            lastPartialTailTranslation = ""
+        } else {
+            val grewEnough =
+                tail.length - lastPartialTail.length >= PARTIAL_RETRANSLATE_MIN_GROWTH
+            val agedEnough =
+                (System.nanoTime() - lastPartialTranslatedAtNanos) / 1_000_000 >= PARTIAL_RETRANSLATE_MIN_INTERVAL_MS
+            val shouldTranslate =
+                tail != lastPartialTail &&
+                    (lastPartialTailTranslation.isEmpty() || grewEnough || agedEnough)
+            if (shouldTranslate) {
+                lastPartialTailTranslation = translatePartial(tail)
+                lastPartialTail = tail
+                lastPartialTranslatedAtNanos = System.nanoTime()
+            } else if (tail != lastPartialTail) {
+                BenchLog.metric("translate_skip kind=partial reason=throttle src_len=${tail.length}")
+            }
+        }
+
+        val translation = listOf(partialStablePrefixTranslation, lastPartialTailTranslation)
+            .filter { it.isNotEmpty() }
+            .joinToString(" ")
 
         return Caption(
             originalText = tentativeSentence,
@@ -378,7 +408,15 @@ class SublySession internal constructor(
         )
     }
 
-    /** Partial translation: degrade on failure, never throw. */
+    /** Index just past the last sentence terminator, or 0 if there is none. */
+    private fun lastTerminatorEnd(text: String): Int {
+        for (i in text.indices.reversed()) {
+            if (text[i] in SENTENCE_TERMINATORS) return i + 1
+        }
+        return 0
+    }
+
+    /** Partial translation: degrade to the source text on failure, never throw. */
     private suspend fun translatePartial(text: String): String {
         val startNanos = System.nanoTime()
         return try {
@@ -389,8 +427,8 @@ class SublySession internal constructor(
             throw e
         } catch (e: Exception) {
             logTranslateMetric("partial", text, "", startNanos, ok = false)
-            Log.w(TAG, "Partial translation failed; degrading to previous/original", e)
-            lastPartialTranslation.ifEmpty { text }
+            Log.w(TAG, "Partial translation failed; emitting source text", e)
+            text
         }
     }
 
@@ -457,6 +495,12 @@ class SublySession internal constructor(
 
     private companion object {
         const val TAG = "SublySession"
+
+        /**
+         * Sentence terminators used to freeze the completed-sentence prefix of
+         * a partial (mirrors [SentenceExtractor]'s set, including CJK marks).
+         */
+        val SENTENCE_TERMINATORS = setOf('.', '!', '?', '…', '。', '！', '？', '．')
 
         /** Pool remainder is flushed as a final this long after the last ASR final. */
         const val IDLE_FLUSH_MS = 3_000L

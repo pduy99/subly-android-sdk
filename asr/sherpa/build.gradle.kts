@@ -32,6 +32,9 @@ dependencies {
     compileOnly(fileTree("libs") { include("*.aar") })
 
     api(projects.asr.api)
+    // api (not implementation): ModelDownloader appears in SherpaOnnxTranscriber's
+    // public constructor, so it must be visible to consumers of this module.
+    api(projects.core.downloader)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)

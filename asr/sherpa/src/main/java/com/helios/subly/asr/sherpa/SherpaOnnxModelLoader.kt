@@ -2,8 +2,11 @@ package com.helios.subly.asr.sherpa
 
 import android.content.Context
 import android.util.Log
+import com.helios.subly.core.downloader.ModelDownloader
+import com.helios.subly.core.downloader.OkHttpModelDownloader
 import java.io.File
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 
 
@@ -17,18 +20,25 @@ import kotlinx.coroutines.flow.flow
  *  1. `filesDir/sherpa-onnx/<dirName>/` already populated (downloaded or
  *     previously extracted) -> reuse.
  *  2. Bundled under `assets/sherpa-onnx/<dirName>/` -> unpack once.
- *  3. Otherwise `null` -> caller should prompt download.
+ *  3. Download each `downloadFiles` entry from `downloadBaseUrl`.
  */
-internal interface SherpaOnnxModelLoaderFactory {
+internal fun interface SherpaOnnxModelLoaderFactory {
     fun create(context: Context): SherpaOnnxModelLoader
 
-    companion object Default : SherpaOnnxModelLoaderFactory {
-        override fun create(context: Context): SherpaOnnxModelLoader =
-            SherpaOnnxModelLoader(context)
+    companion object {
+        /** Factory backed by the default OkHttp downloader. */
+        val Default: SherpaOnnxModelLoaderFactory = of(OkHttpModelDownloader())
+
+        /** Factory that builds loaders around a caller-supplied [downloader]. */
+        fun of(downloader: ModelDownloader): SherpaOnnxModelLoaderFactory =
+            SherpaOnnxModelLoaderFactory { context -> SherpaOnnxModelLoader(context, downloader) }
     }
 }
 
-internal open class SherpaOnnxModelLoader(private val context: Context) {
+internal open class SherpaOnnxModelLoader(
+    private val context: Context,
+    private val downloader: ModelDownloader = OkHttpModelDownloader(),
+) {
 
     private val rootDir: File by lazy {
         File(context.filesDir, MODELS_DIR).apply { mkdirs() }
@@ -54,6 +64,49 @@ internal open class SherpaOnnxModelLoader(private val context: Context) {
     @Suppress("unused")
     fun isReady(model: SherpaOnnxModel): Boolean =
         hasRequiredFiles(model, File(rootDir, model.dirName))
+
+    /**
+     * Makes [model] available on disk, emitting progress in [0.0, 1.0].
+     *
+     * Priority: already-present (instant 1.0) -> unpack app-bundled assets ->
+     * download [SherpaOnnxModel.downloadFiles]. Completes without reaching
+     * 1.0 only if no source is available; the caller MUST verify with
+     * [isReady] afterwards (a finished-but-not-ready flow means "couldn't
+     * provision"). Collect on [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun provisionWithProgress(model: SherpaOnnxModel): Flow<Float> = flow {
+        val target = File(rootDir, model.dirName)
+        if (hasRequiredFiles(model, target)) {
+            emit(1f)
+            return@flow
+        }
+
+        // Prefer an app-bundled asset copy when present (offline / no network).
+        val assetDir = "$ASSETS_DIR/${model.dirName}"
+        val bundled = runCatching { context.assets.list(assetDir).orEmpty() }.getOrDefault(emptyArray())
+        if (bundled.isNotEmpty()) {
+            emitAll(extractWithProgress(model))
+            return@flow
+        }
+
+        if (model.downloadFiles.isEmpty() || model.downloadBaseUrl.isEmpty()) {
+            Log.w(TAG, "No bundled assets and no download source for ${model.dirName}.")
+            return@flow
+        }
+
+        // Download each file, weighting progress equally across the file count.
+        target.mkdirs()
+        val total = model.downloadFiles.size
+        model.downloadFiles.forEachIndexed { index, fileName ->
+            val dest = File(target, fileName)
+            val url = "${model.downloadBaseUrl.trimEnd('/')}/$fileName?download=true"
+            downloader.downloadModel(url, dest).collect { fileProgress ->
+                emit(((index + fileProgress) / total).coerceIn(0f, 1f))
+            }
+        }
+        Log.i(TAG, "Downloaded ${model.dirName} -> ${target.absolutePath}")
+        emit(1f)
+    }
 
     /**
      * Extracts the model asset bundle to [downloadTarget] with progress.
@@ -130,7 +183,7 @@ internal open class SherpaOnnxModelLoader(private val context: Context) {
     }
 
     private companion object {
-        const val TAG = "DUY"
+        const val TAG = "SherpaOnnxModelLoader"
         const val MODELS_DIR = "sherpa-onnx"
         const val ASSETS_DIR = "sherpa-onnx"
     }

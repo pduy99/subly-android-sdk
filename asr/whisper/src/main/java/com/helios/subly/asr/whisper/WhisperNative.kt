@@ -23,11 +23,32 @@ internal object WhisperNative {
     /** True only when the .so is loaded AND the JNI symbols are present. */
     fun isAvailable(): Boolean = isLoaded && runCatching { nativeIsAvailable() }.getOrDefault(false)
 
-    /** Returns a context handle (>0) or 0 on failure. */
-    external fun nativeInit(modelPath: String, targetLanguageCode: String): Long
+    /**
+     * Returns a context handle (>0) or 0 on failure.
+     *
+     * [vadModelPath] points at a ggml Silero VAD model; pass an empty string
+     * to disable the pre-transcribe speech gate. A failed VAD load is
+     * non-fatal (the gate is simply skipped).
+     */
+    external fun nativeInit(
+        modelPath: String,
+        targetLanguageCode: String,
+        vadModelPath: String,
+    ): Long
 
-    /** Runs full inference over one PCM window; returns concatenated text. */
-    external fun nativeTranscribe(handle: Long, pcm: FloatArray, sampleRate: Int): String
+    /**
+     * Runs full inference over one PCM window; returns concatenated text.
+     *
+     * @param gateWithVad when true, runs the Silero VAD speech gate before
+     *   decoding (used for final windows). Partial windows pass `false` to skip
+     *   the per-call full-window VAD scan — see [WhisperTranscriber].
+     */
+    external fun nativeTranscribe(
+        handle: Long,
+        pcm: FloatArray,
+        sampleRate: Int,
+        gateWithVad: Boolean,
+    ): String
 
     /**
      * BCP-47 tag whisper detected on the most recent [nativeTranscribe]

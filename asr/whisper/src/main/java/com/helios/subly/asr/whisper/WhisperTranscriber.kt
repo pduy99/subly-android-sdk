@@ -29,11 +29,19 @@ class WhisperTranscriber(
     private val modelDownloader: ModelDownloader = OkHttpModelDownloader(),
     /**
      * ggml model file name on the `ggerganov/whisper.cpp` HF repo. The
-     * default is the q5_1-quantized base model: ~2.4x smaller than f16
-     * `ggml-base.bin` and meaningfully faster on NEON, at a small accuracy
+     * default is the q8_0-quantized base model: ~2x smaller than f16
+     * `ggml-base-q8_0.bin` and meaningfully faster on NEON, at a small accuracy
      * cost. Use `ggml-tiny-q8_0.bin` for low-end devices.
      */
     private val modelAsset: String = DEFAULT_MODEL_ASSET,
+    /**
+     * ggml Silero VAD model file name on the `ggml-org/whisper-vad` HF repo.
+     * Downloaded alongside the main model and used as a neural speech gate to
+     * reject background music / noise before transcription (see the
+     * non-speech rejection layers in `whisper-jni.cpp`). Set to an empty
+     * string to disable the gate and rely only on the post-decode guards.
+     */
+    private val vadModelAsset: String = DEFAULT_VAD_ASSET,
 ) : SublyAsr {
 
     private val handleRef = AtomicLong(0L)
@@ -62,11 +70,11 @@ class WhisperTranscriber(
         }
 
         val modelPath = runCatching {
-            // Download/extraction phase: 0.0 -> 0.9 (progress is normalized
-            // to 0..1 per the ModelPrepState contract — previously this
-            // emitted 0..90 and broke any progress bar built on it).
-            ensureModelExtractedWithProgress { progress ->
-                emit(ModelPrepState.Preparing(progress * 0.9f))
+            // Speech model download/extraction phase: 0.0 -> 0.85 (progress is
+            // normalized to 0..1 per the ModelPrepState contract — previously
+            // this emitted 0..90 and broke any progress bar built on it).
+            ensureFileDownloaded(modelAsset, modelUrl(modelAsset)) { progress ->
+                emit(ModelPrepState.Preparing(progress * 0.85f))
             }
         }.getOrElse {
             Log.e(TAG, "Failed to obtain whisper model", it)
@@ -74,10 +82,26 @@ class WhisperTranscriber(
             return@flow
         }
 
+        // VAD model download phase: 0.85 -> 0.9. The VAD model is small and
+        // optional — a failed download must NOT fail prepare, it just disables
+        // the speech gate (the post-decode guards still run).
+        val vadPath = if (vadModelAsset.isEmpty()) {
+            ""
+        } else {
+            runCatching {
+                ensureFileDownloaded(vadModelAsset, vadModelUrl(vadModelAsset)) { progress ->
+                    emit(ModelPrepState.Preparing(0.85f + progress * 0.05f))
+                }
+            }.getOrElse {
+                Log.w(TAG, "VAD model unavailable; speech gate disabled.", it)
+                ""
+            }
+        }
+
         // Native init phase: 0.9 -> 1.0
         emit(ModelPrepState.Preparing(0.9f))
         val initStartNanos = System.nanoTime()
-        val created = backend.init(modelPath, targetLangRef.get())
+        val created = backend.init(modelPath, targetLangRef.get(), vadPath)
         BenchLog.metric(
             "model_init ms=${(System.nanoTime() - initStartNanos) / 1_000_000} " +
                     "model=$modelAsset ok=${created != 0L}"
@@ -145,7 +169,14 @@ class WhisperTranscriber(
                 val rawText = runCatching {
                     synchronized(nativeLock) {
                         val h = handleRef.get()
-                        if (h == 0L) "" else backend.transcribe(h, pcm, WHISPER_SAMPLE_RATE).trim()
+                        // Gate non-speech with the VAD only on finals. Partials
+                        // grow every ~800 ms; re-scanning the whole window each
+                        // time costs up to ~1 s and the VAD always passes during
+                        // real speech anyway. Final windows still gate, and the
+                        // post-decode no-speech/log-prob guards cover partials.
+                        if (h == 0L) "" else backend.transcribe(
+                            h, pcm, WHISPER_SAMPLE_RATE, /* gateWithVad = */ window.isFinal,
+                        ).trim()
                     }
                 }.getOrElse { e ->
                     Log.w(TAG, "Whisper native transcribe failed", e)
@@ -244,31 +275,40 @@ class WhisperTranscriber(
     // Model extraction
     // -------------------------------------------------------------------------
 
-    private suspend fun ensureModelExtractedWithProgress(
+    private suspend fun ensureFileDownloaded(
+        assetName: String,
+        url: String,
         onProgress: suspend (Float) -> Unit,
     ): String {
         val outDir = File(context.filesDir, "whisper").apply { mkdirs() }
-        val outFile = File(outDir, modelAsset)
+        val outFile = File(outDir, assetName)
 
         if (outFile.exists() && outFile.length() > 0L) {
             onProgress(1f)
             return outFile.absolutePath
         }
 
-        val modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${modelAsset}?download=true"
-        modelDownloader.downloadModel(modelUrl, outFile).collect { progress ->
+        modelDownloader.downloadModel(url, outFile).collect { progress ->
             onProgress(progress)
         }
 
         return outFile.absolutePath
     }
 
+    private fun modelUrl(asset: String) =
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$asset?download=true"
+
+    private fun vadModelUrl(asset: String) =
+        "https://huggingface.co/ggml-org/whisper-vad/resolve/main/$asset?download=true"
+
     private fun String.normalizeLangTag(): String =
         substringBefore('-').lowercase().takeIf { it.isNotBlank() && it != "auto" } ?: ""
 
     companion object {
         private const val TAG = "WhisperTranscriber"
-        const val DEFAULT_MODEL_ASSET = "ggml-base-q5_1.bin"
+        const val DEFAULT_MODEL_ASSET = "ggml-base-q8_0.bin"
+        /** ggml Silero VAD model (~885 KB) on the `ggml-org/whisper-vad` repo. */
+        const val DEFAULT_VAD_ASSET = "ggml-silero-v5.1.2.bin"
         private const val WHISPER_SAMPLE_RATE = 16_000
     }
 }
