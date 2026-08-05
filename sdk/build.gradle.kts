@@ -8,13 +8,13 @@ version = "0.0.1"
 android {
     namespace = "com.helios.subly.sdk"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
+        version = release(libs.versions.compileSdk.get().toInt()) {
+            minorApiLevel = libs.versions.compileSdkMinor.get().toInt()
         }
     }
 
     defaultConfig {
-        minSdk = 34
+        minSdk = libs.versions.minSdk.get().toInt()
         consumerProguardFiles("consumer-rules.pro")
     }
 

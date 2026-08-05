@@ -1,4 +1,8 @@
 [versions]
+minSdk = "31"
+targetSdk = "36"
+compileSdk = "36"
+compileSdkMinor = "1"
 agp = "9.2.0-rc01"
 kotlin = "2.3.21"
 junit = "4.13.2"

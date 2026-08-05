@@ -5,13 +5,13 @@ plugins {
 android {
     namespace = "com.helios.subly.asr.sherpa"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
+        version = release(libs.versions.compileSdk.get().toInt()) {
+            minorApiLevel = libs.versions.compileSdkMinor.get().toInt()
         }
     }
 
     defaultConfig {
-        minSdk = 34
+        minSdk = libs.versions.minSdk.get().toInt()
 
         // arm64-v8a only: minSdk 34 devices are universally 64-bit ARM
         ndk {

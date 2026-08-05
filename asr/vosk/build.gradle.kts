@@ -5,13 +5,13 @@ plugins {
 android {
     namespace = "com.helios.subly.asr.vosk"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
+        version = release(libs.versions.compileSdk.get().toInt()) {
+            minorApiLevel = libs.versions.compileSdkMinor.get().toInt()
         }
     }
 
     defaultConfig {
-        minSdk = 34
+        minSdk = libs.versions.minSdk.get().toInt()
 
         // arm64-v8a only, to match the rest of the SDK. vosk-android ships
         // libvosk.so + JNA's libjnidispatch.so for this ABI inside the AAR.
