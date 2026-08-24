@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.transform
 import java.util.concurrent.atomic.AtomicReference
@@ -41,15 +42,16 @@ class SherpaOnnxTranscriber internal constructor(
         modelLoaderFactory = SherpaOnnxModelLoaderFactory.of(modelDownloader),
     )
 
+    /**
+     * Sherpa is a streaming, endpoint-based engine: each final is a complete
+     * utterance/clause finalized on a trailing pause. Stream them one-to-one
+     * instead of pooling into sentences (which would batch finals and add
+     * latency — the opposite of the streaming experience this engine is for).
+     */
+    override val emitsCompleteUtterances: Boolean = true
+
     /** Lazily-initialized recognizer/stream pair. Cleared on [release]. */
     private val handleRef = AtomicReference<SherpaOnnxBackend.Handle?>(null)
-
-    /**
-     * Optional punctuation model, prepared best-effort alongside the ASR
-     * model. `null` means punctuation couldn't be provisioned — finals are
-     * then emitted verbatim (still correct, just unpunctuated).
-     */
-    private val punctuationRef = AtomicReference<SherpaOnnxPunctuation?>(null)
 
     /**
      * Serializes backend calls. Necessary because sherpa-onnx mutates the
@@ -78,6 +80,17 @@ class SherpaOnnxTranscriber internal constructor(
         var lastEmittedText = ""
         var lastPartialEmitMs = 0L
         var utteranceStartMs = -1L
+        // Only the first caption of a stream reliably starts a sentence. After
+        // that, an endpoint is a breath pause, not a full stop, so we stay
+        // lower-case until something actually terminates a sentence.
+        var atSentenceStart = true
+        // Hypothesis decoded but not yet committed as a final. Audio does not
+        // always end on a pause — a clip can be cut mid-sentence, and a user
+        // can stop capture mid-word — so without an explicit flush the tail of
+        // the stream is silently dropped. It previously survived only by
+        // accident, because a hard elapsed-time endpoint cut every utterance
+        // short; that rule is gone (it severed words), so flush deliberately.
+        var pendingText = ""
 
         return frames
             .transform { frame ->
@@ -93,20 +106,32 @@ class SherpaOnnxTranscriber internal constructor(
                 }
 
                 if (result == null) return@transform
-                val text = result.text.trim()
+                // The model's token vocabulary is upper-case, so every
+                // hypothesis arrives shouting. Normalise here, before partial
+                // debounce and endpoint emission, so partials and finals stay
+                // consistent — a caption that flips case as it finalises is
+                // worse than either form on its own.
+                val text = CasingNormalizer.normalise(result.text.trim(), atSentenceStart)
+
+                pendingText = text
 
                 if (result.isEndpoint) {
+                    pendingText = ""
                     if (text.isNotEmpty()) {
-                        // Restore casing/punctuation if the punctuation model
-                        // is available; otherwise emit the raw hypothesis.
-                        // Streaming Zipformer output is lowercase + unpunctuated,
-                        // and the SDK's sentence assembly keys off punctuation.
-                        val finalText = punctuationRef.get()?.let { p ->
-                            runCatching { p.punctuate(text) }.getOrDefault(text)
-                        } ?: text
+                        // Casing is normalised above; punctuation is not.
+                        // Sherpa is the low-latency streaming engine, and
+                        // restoring terminators at endpoints writes periods
+                        // mid-clause whenever a speaker pauses for breath
+                        // (measured: readability 45 -> 38 on English), so
+                        // finals go out unpunctuated and flow immediately.
                         // NOTE: never log transcript content — it is end-user speech.
-                        Log.d(TAG, "Emitted final packet (length=${finalText.length})")
-                        emit(AsrResult.Final(finalText))
+                        Log.d(TAG, "Emitted final packet (length=${text.length})")
+                        emit(AsrResult.Final(text))
+                        // The next caption opens a sentence only if this one
+                        // closed one. This engine emits no terminators, so in
+                        // practice that is false — but it stays correct if a
+                        // punctuating model is swapped in later.
+                        atSentenceStart = text.last() in SENTENCE_TERMINATORS
                     }
                     synchronized(nativeLock) { handleRef.get()?.let(backend::reset) }
                     lastEmittedText = ""
@@ -127,6 +152,16 @@ class SherpaOnnxTranscriber internal constructor(
                     lastPartialEmitMs = now
                     Log.d(TAG, "Emitted partial packet (length=${text.length})")
                     emit(AsrResult.Partial(text))
+                }
+            }
+            .onCompletion { cause ->
+                // Only on a clean end of audio. On cancellation the collector
+                // is going away and a late caption would arrive after the
+                // caller believed the session was over.
+                if (cause == null && pendingText.isNotEmpty()) {
+                    Log.d(TAG, "Flushed tail packet (length=${pendingText.length})")
+                    emit(AsrResult.Final(pendingText))
+                    pendingText = ""
                 }
             }
             .flowOn(Dispatchers.Default)
@@ -160,9 +195,9 @@ class SherpaOnnxTranscriber internal constructor(
 
         val loader = modelLoaderFactory.create(context)
 
-        // ASR provisioning (on-disk / bundled assets / download): 0% -> 80%
+        // ASR provisioning (on-disk / bundled assets / download): 0% -> 90%
         loader.provisionWithProgress(model)
-            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.8f)) }
+            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.9f)) }
             .collect {}
 
         // A finished-but-not-ready provision means no source was available.
@@ -181,7 +216,7 @@ class SherpaOnnxTranscriber internal constructor(
         }
 
         val modelDir = loader.downloadTarget(model).absolutePath
-        emit(ModelPrepState.Preparing(0.85f))
+        emit(ModelPrepState.Preparing(0.95f))
 
         // ASR native init.
         val created = backend.init(modelDir, model.sampleRateHz)
@@ -198,22 +233,6 @@ class SherpaOnnxTranscriber internal constructor(
             runCatching { backend.release(created) }
         }
 
-        // Punctuation: best-effort. Failure to provision or init MUST NOT fail
-        // prepare — the engine still works, finals are just unpunctuated.
-        // Progress 85% -> 100% so a punct download is visible to the user.
-        runCatching {
-            loader.provisionWithProgress(SherpaOnnxModel.PUNCTUATION_EN)
-                .onEach { p -> emit(ModelPrepState.Preparing(0.85f + p * 0.15f)) }
-                .collect {}
-            if (loader.isReady(SherpaOnnxModel.PUNCTUATION_EN)) {
-                val punctDir = loader.downloadTarget(SherpaOnnxModel.PUNCTUATION_EN).absolutePath
-                punctuationRef.set(SherpaOnnxPunctuation(punctDir))
-                Log.i(TAG, "Punctuation model ready.")
-            } else {
-                Log.w(TAG, "Punctuation model unavailable; finals will be unpunctuated.")
-            }
-        }.onFailure { Log.w(TAG, "Punctuation prepare failed; continuing without it.", it) }
-
         emit(ModelPrepState.Ready)
     }.flowOn(Dispatchers.IO)
 
@@ -221,7 +240,6 @@ class SherpaOnnxTranscriber internal constructor(
         synchronized(nativeLock) {
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
         }
-        punctuationRef.getAndSet(null)?.let { runCatching { it.release() } }
     }
 
     override fun supportedLanguages(): List<String> = listOf("en")
@@ -308,5 +326,8 @@ class SherpaOnnxTranscriber internal constructor(
 
         /** Min wall-clock gap between two partial emissions for the same utterance. */
         const val PARTIAL_MIN_INTERVAL_MS = 200L
+
+        /** Terminators across the scripts this SDK captions, incl. full-width. */
+        val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '。', '！', '？')
     }
 }

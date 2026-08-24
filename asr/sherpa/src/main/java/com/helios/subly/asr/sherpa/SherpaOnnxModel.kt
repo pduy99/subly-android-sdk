@@ -56,26 +56,6 @@ internal enum class SherpaOnnxModel(
         downloadBaseUrl =
             "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main",
         approxSizeBytes = 90L * 1024 * 1024,
-    ),
-
-    /**
-     * Punctuation: English online punctuation model (int8). Optional — the
-     * transcriber falls back to unpunctuated finals if this can't be obtained.
-     */
-    PUNCTUATION_EN(
-        dirName = "sherpa-onnx-online-punct-en",
-        kind = SherpaModelKind.PUNCTUATION,
-        assetPatterns = listOf(
-            Regex("model.*\\.onnx"),
-            Regex("bpe\\.vocab"),
-        ),
-        downloadFiles = listOf(
-            "model.int8.onnx",
-            "bpe.vocab",
-        ),
-        downloadBaseUrl =
-            "https://huggingface.co/brady-pplx/sherpa-onnx-online-punct-en-2024-08-06/resolve/main",
-        approxSizeBytes = 8L * 1024 * 1024,
     );
 
     companion object {

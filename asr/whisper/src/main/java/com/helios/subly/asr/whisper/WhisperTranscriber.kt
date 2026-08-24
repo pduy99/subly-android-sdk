@@ -28,10 +28,10 @@ class WhisperTranscriber(
     private val speechSegmenter: SpeechSegmenter = SpeechSegmenter(),
     private val modelDownloader: ModelDownloader = OkHttpModelDownloader(),
     /**
-     * ggml model file name on the `ggerganov/whisper.cpp` HF repo. The
-     * default is the q8_0-quantized base model: ~2x smaller than f16
-     * `ggml-base-q8_0.bin` and meaningfully faster on NEON, at a small accuracy
-     * cost. Use `ggml-tiny-q8_0.bin` for low-end devices.
+     * ggml model file name on the `ggerganov/whisper.cpp` HF repo. Defaults
+     * to [DEFAULT_MODEL_ASSET]. Pass `ggml-base-q8_0.bin` or
+     * `ggml-tiny-q8_0.bin` for devices that need a smaller download or
+     * faster-than-real-time transcription.
      */
     private val modelAsset: String = DEFAULT_MODEL_ASSET,
     /**
@@ -42,6 +42,14 @@ class WhisperTranscriber(
      * string to disable the gate and rely only on the post-decode guards.
      */
     private val vadModelAsset: String = DEFAULT_VAD_ASSET,
+    /**
+     * Optional decoding-prompt bias passed to whisper as `initial_prompt`:
+     * domain hotwords, product names, and proper nouns the model otherwise
+     * mis-recognizes (e.g. "Fortnite, USB, gigabit"). whisper biases decoding
+     * toward this vocabulary. Keep it short — long prompts can make the model
+     * "continue" them. Empty disables biasing.
+     */
+    private val glossary: String = "",
 ) : SublyAsr {
 
     private val handleRef = AtomicLong(0L)
@@ -101,7 +109,7 @@ class WhisperTranscriber(
         // Native init phase: 0.9 -> 1.0
         emit(ModelPrepState.Preparing(0.9f))
         val initStartNanos = System.nanoTime()
-        val created = backend.init(modelPath, targetLangRef.get(), vadPath)
+        val created = backend.init(modelPath, targetLangRef.get(), vadPath, glossary.trim())
         BenchLog.metric(
             "model_init ms=${(System.nanoTime() - initStartNanos) / 1_000_000} " +
                     "model=$modelAsset ok=${created != 0L}"
@@ -306,7 +314,17 @@ class WhisperTranscriber(
 
     companion object {
         private const val TAG = "WhisperTranscriber"
-        const val DEFAULT_MODEL_ASSET = "ggml-base-q8_0.bin"
+        /**
+         * The q5_1-quantized `small` model (~190 MB).
+         *
+         * Chosen over `base-q8_0` (78 MB) for accuracy, most visibly on
+         * Japanese, where `small` measured 20 -> 35 against base. The costs
+         * are real and deliberate: a ~2.4x larger first-run download, and
+         * ~3.2x real-time transcription on a Galaxy S24 versus ~2.3x for
+         * base. Devices that cannot afford either should pass
+         * `ggml-tiny-q8_0.bin` or `ggml-base-q8_0.bin` explicitly.
+         */
+        const val DEFAULT_MODEL_ASSET = "ggml-small-q5_1.bin"
         /** ggml Silero VAD model (~885 KB) on the `ggml-org/whisper-vad` repo. */
         const val DEFAULT_VAD_ASSET = "ggml-silero-v5.1.2.bin"
         private const val WHISPER_SAMPLE_RATE = 16_000

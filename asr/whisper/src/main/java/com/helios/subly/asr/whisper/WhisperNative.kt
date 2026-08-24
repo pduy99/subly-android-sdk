@@ -29,11 +29,16 @@ internal object WhisperNative {
      * [vadModelPath] points at a ggml Silero VAD model; pass an empty string
      * to disable the pre-transcribe speech gate. A failed VAD load is
      * non-fatal (the gate is simply skipped).
+     *
+     * [glossary] is an optional decoding-prompt bias (domain hotwords / names);
+     * whisper biases decoding toward its vocabulary, improving proper nouns.
+     * Pass an empty string to disable.
      */
     external fun nativeInit(
         modelPath: String,
         targetLanguageCode: String,
         vadModelPath: String,
+        glossary: String,
     ): Long
 
     /**

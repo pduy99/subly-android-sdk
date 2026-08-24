@@ -49,6 +49,13 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
+    testOptions {
+        // SpeechSegmenter logs benchmark metrics through android.util.Log,
+        // which is a stub on the host JVM; without this every segment close
+        // throws instead of logging.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {

@@ -9,8 +9,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <set>
+#include <cctype>
 
 #include "whisper.h"
+#include "utf8_safe.h"
 
 #define TAG "SublyWhisperJni"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -31,7 +34,49 @@ namespace {
         std::string pinned_lang;     // language pinned after first detection
         std::string last_detected;
         std::mutex   detected_mu;
+
+        // Decoding-prompt biasing (improves proper nouns + cross-window
+        // continuity; fed as whisper `initial_prompt`, see nativeTranscribe):
+        //   glossary  — static hotwords supplied at init, biases every window.
+        //   carry     — rolling tail of recent *committed* (final) text, so
+        //               each window decodes with the last sentence as context.
+        std::string glossary;
+        std::string carry;
+        std::mutex   prompt_mu;
     };
+
+    // Cap on the rolling context carried between windows. Long prompts make
+    // whisper "continue" them (hallucination risk) and cost prompt-decode
+    // time; the last ~200 chars is enough to disambiguate continuations.
+    constexpr size_t MAX_CARRY_CHARS = 200;
+
+    // Cheap repetition-loop detector for the context carry. A decode dominated
+    // by a handful of repeated words (music intros, noisy audio) is a
+    // hallucination loop; carrying it as the next window's prompt makes whisper
+    // repeat it further. Returns true when the unique-word fraction is low.
+    bool looksRepetitive(const std::string & s) {
+        std::vector<std::string> words;
+        std::string cur;
+        for (char c : s) {
+            if (c == ' ' || c == '\n' || c == '\t') {
+                if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+            } else {
+                cur += (char) std::tolower((unsigned char) c);
+            }
+        }
+        if (!cur.empty()) words.push_back(cur);
+
+        // Scripts without word spacing (Chinese, Japanese) collapse to a
+        // single "word", which used to fall through as "not repetitive" and
+        // left the guard inert for exactly the languages whisper loops on
+        // most. Judge those by character instead.
+        if (words.size() < 6) {
+            return subly::utf8::uniqueCharFraction(s, /*minChars=*/12) < 0.5;
+        }
+
+        std::set<std::string> uniq(words.begin(), words.end());
+        return (double) uniq.size() / (double) words.size() < 0.5;
+    }
 
     inline std::string jstring_to_std(JNIEnv * env, jstring s) {
         if (!s) return {};
@@ -123,6 +168,40 @@ namespace {
     // quiet/soft speech is being dropped.
     constexpr float VAD_SPEECH_PROB = 0.50f;
 
+    // The Silero VAD scan is O(audio length) and on a full 5 s final window
+    // costs ~2-3 s — more than the whisper decode it gates, which made it the
+    // dominant final-caption latency. We only need to confirm *speech is
+    // present*, so the gate scans this leading slice first and passes the
+    // window the moment it finds speech there.
+    //
+    // The front is not always enough, though. A window opened on a speech
+    // onset does start with speech, but a window force-closed at
+    // MAX_SEGMENT_MS hands its tail to the *next* window as left-context, and
+    // that carried tail is frequently low-energy — the trailing edge of a
+    // word rather than an onset. Measured over the benchmark corpus, 45% of
+    // Japanese final windows scored below threshold on their leading 1500 ms
+    // while the same windows scored 1.00 when scanned whole. Those were real
+    // sentences, dropped without a decode.
+    //
+    // So a window that fails the front scan gets a second look at everything
+    // after it (see the two-tier gate below) before being dropped.
+    constexpr int VAD_SCAN_MAX_MS = 1500;
+
+    // Loudest per-frame speech probability Silero reports over [pcm, pcm+n).
+    // Negative when the detector itself failed, which the caller treats the
+    // same as "no speech found here" — a failed scan must not pass a window.
+    inline float vadMaxProb(whisper_vad_context * vad, const float * pcm, int n) {
+        if (n <= 0) return -1.0f;
+        if (!whisper_vad_detect_speech(vad, pcm, n)) return -1.0f;
+        const int    n_probs = whisper_vad_n_probs(vad);
+        const float * probs  = whisper_vad_probs(vad);
+        float max_prob = 0.0f;
+        for (int i = 0; i < n_probs && probs; ++i) {
+            if (probs[i] > max_prob) max_prob = probs[i];
+        }
+        return max_prob;
+    }
+
     // Whisper's own per-segment no-speech probability above which we drop.
     constexpr float NO_SPEECH_THRESHOLD = 0.60f;
 
@@ -146,11 +225,13 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
         JNIEnv * env, jobject /*thiz*/,
         jstring model_path_jstr,
         jstring target_language_jstr,
-        jstring vad_model_path_jstr) {
+        jstring vad_model_path_jstr,
+        jstring glossary_jstr) {
 
     std::string model_path = jstring_to_std(env, model_path_jstr);
     std::string target     = jstring_to_std(env, target_language_jstr);
     std::string vad_path   = jstring_to_std(env, vad_model_path_jstr);
+    std::string glossary   = jstring_to_std(env, glossary_jstr);
 
     if (model_path.empty()) {
         LOGE("nativeInit: empty model path");
@@ -218,8 +299,9 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
     handle->ctx = ctx;
     handle->vad = vad;
     handle->target_lang = target;
-    LOGI("nativeInit: ctx=%p vad=%p target='%s' threads=%d",
-            ctx, vad, target.c_str(), optimalThreadCount());
+    handle->glossary = glossary;
+    LOGI("nativeInit: ctx=%p vad=%p target='%s' threads=%d glossary_len=%zu",
+            ctx, vad, target.c_str(), optimalThreadCount(), glossary.size());
     return reinterpret_cast<jlong>(handle);
 }
 
@@ -258,27 +340,40 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
     // / log-prob guards below and never reaches a committed final anyway.
     if (handle->vad && gate_with_vad) {
         const auto t_vad = std::chrono::steady_clock::now();
-        // detect_speech resets LSTM state; correct here since each window is
-        // an independent (possibly growing) snapshot passed in full.
-        const bool ok = whisper_vad_detect_speech(
-                handle->vad, pcmf32.data(), (int) pcmf32.size());
-        float max_prob = 0.0f;
-        if (ok) {
-            const int   n_probs = whisper_vad_n_probs(handle->vad);
-            const float * probs = whisper_vad_probs(handle->vad);
-            for (int i = 0; i < n_probs && probs; ++i) {
-                if (probs[i] > max_prob) max_prob = probs[i];
-            }
+        // Tier 1 — the leading slice. Most windows do open on a speech onset,
+        // so this passes them at a fraction of the full-window cost.
+        const int scan_samples = std::min(
+                (int) pcmf32.size(), VAD_SCAN_MAX_MS * WHISPER_SAMPLE_RATE / 1000);
+        float max_prob = vadMaxProb(handle->vad, pcmf32.data(), scan_samples);
+
+        int scanned = scan_samples;
+        bool second_tier = false;
+        if (max_prob < VAD_SPEECH_PROB && (int) pcmf32.size() > scan_samples) {
+            // Tier 2 — everything after the leading slice. Only reached for a
+            // window that was about to be thrown away, so the extra scan is
+            // paid for exactly when it can save a caption, and never on the
+            // hot path. Scanning only the remainder (rather than rescanning
+            // the whole window) is equivalent here: detect_speech resets LSTM
+            // state per call, and over the benchmark corpus the two agreed on
+            // every window.
+            second_tier = true;
+            const float rest = vadMaxProb(
+                    handle->vad, pcmf32.data() + scan_samples,
+                    (int) pcmf32.size() - scan_samples);
+            if (rest > max_prob) max_prob = rest;
+            scanned = (int) pcmf32.size();
         }
+
         const double vad_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_vad).count();
-        if (!ok || max_prob < VAD_SPEECH_PROB) {
-            LOGBENCH("vad_drop max_prob=%.2f audio_ms=%.0f vad_ms=%.1f",
-                     max_prob, audio_ms_in, vad_ms);
+        const double scanned_ms = (double) scanned * 1000.0 / WHISPER_SAMPLE_RATE;
+        if (max_prob < VAD_SPEECH_PROB) {
+            LOGBENCH("vad_drop max_prob=%.2f audio_ms=%.0f scanned_ms=%.0f vad_ms=%.1f tier2=%d",
+                     max_prob, audio_ms_in, scanned_ms, vad_ms, second_tier ? 1 : 0);
             return env->NewStringUTF("");
         }
-        LOGBENCH("vad_pass max_prob=%.2f audio_ms=%.0f vad_ms=%.1f",
-                 max_prob, audio_ms_in, vad_ms);
+        LOGBENCH("vad_pass max_prob=%.2f audio_ms=%.0f scanned_ms=%.0f vad_ms=%.1f tier2=%d",
+                 max_prob, audio_ms_in, scanned_ms, vad_ms, second_tier ? 1 : 0);
     }
 
     whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -291,9 +386,8 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
     params.n_threads        = optimalThreadCount();
     params.single_segment   = true;
 
-    // Latency: don't decode timestamp tokens (unused downstream), bound the
-    // decode length, and disable temperature fallback — a low-confidence
-    // chunk can otherwise trigger up to 5 full re-decodes.
+    // Latency: don't decode timestamp tokens (unused downstream) and bound the
+    // decode length. Temperature fallback is set below (finals only).
     //
     // max_tokens is proportional to audio duration (~16 tokens/sec of audio,
     // vs. real speech at ~2-6 tokens/sec). A fixed cap of 64 let the decoder
@@ -304,10 +398,36 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
     const int max_tokens = std::clamp((int) (n_samples / 1000), 16, 64);
     params.no_timestamps    = true;
     params.max_tokens       = max_tokens;
-    params.temperature_inc  = 0.0f;
+    // Temperature fallback, finals only. This is whisper's repetition-loop
+    // breaker: when the greedy pass fails the entropy (compression-ratio) /
+    // log-prob thresholds — exactly what happens on music intros and noisy
+    // audio — it re-decodes at a higher temperature instead of emitting the
+    // loop. It does NOT fire on clean speech (greedy passes), so the cost is
+    // paid only on the bad chunks that need it. Earlier final latency was
+    // dominated by the full-window VAD scan, not this; with the VAD now capped
+    // (VAD_SCAN_MAX_MS) the fallback is affordable. Partials stay single-pass
+    // (temperature_inc=0): they're disposable and on the hot path.
+    params.temperature_inc  = gate_with_vad ? 0.2f : 0.0f;
     params.suppress_blank   = true;
     params.suppress_nst     = true;
     params.audio_ctx        = audioCtxFor((int) pcmf32.size());
+
+    // Prompt biasing: static glossary (hotwords) + rolling context from recent
+    // finals. whisper biases decoding toward prompt vocabulary, which fixes
+    // proper nouns ("Fortnite", "USB") and continuations across window cuts.
+    // We keep no_context=true and manage context explicitly here so partial
+    // re-transcriptions can't pollute the committed context. `prompt` must
+    // outlive whisper_full below (it does — function scope).
+    std::string prompt;
+    {
+        std::lock_guard<std::mutex> lk(handle->prompt_mu);
+        prompt = handle->glossary;
+        if (!handle->carry.empty()) {
+            if (!prompt.empty()) prompt += " ";
+            prompt += handle->carry;
+        }
+    }
+    params.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
 
     // Language: explicit target wins; otherwise auto-detect once, then pin
     // the detected language so we don't pay detection on every chunk.
@@ -413,11 +533,46 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeTranscribe(
         if (seg) result.append(seg);
     }
 
+    // Carry the tail of committed (final) text forward as context for the next
+    // window. Finals only: partials are re-transcriptions of the same audio
+    // and would compound. Skip repetition loops (looksRepetitive) — carrying a
+    // looped decode as the next prompt makes whisper continue the loop. Only
+    // non-empty results that passed the hallucination guards reach here.
+    if (gate_with_vad && !result.empty() && !looksRepetitive(result)) {
+        std::lock_guard<std::mutex> lk(handle->prompt_mu);
+        if (result.size() <= MAX_CARRY_CHARS) {
+            handle->carry = result;
+        } else {
+            size_t start = result.size() - MAX_CARRY_CHARS;
+            const size_t sp = result.find(' ', start); // align to a word boundary
+            if (sp != std::string::npos && sp + 1 < result.size()) start = sp + 1;
+            // MAX_CARRY_CHARS is a byte budget and the word-boundary search
+            // above never fires on CJK, so the offset lands mid-character two
+            // times in three. Snap forward to a character start.
+            start = subly::utf8::alignStart(result, start);
+            handle->carry = result.substr(start);
+        }
+        // Trim leading/trailing whitespace whisper sometimes prepends.
+        const size_t b = handle->carry.find_first_not_of(" \t\n");
+        const size_t e = handle->carry.find_last_not_of(" \t\n");
+        handle->carry = (b == std::string::npos) ? std::string()
+                                                 : handle->carry.substr(b, e - b + 1);
+    }
+
     // Never log transcript content — it is end-user speech.
     LOGI("nativeTranscribe: %d samples → %d segments → %zu chars (audio_ctx=%d)",
             n_samples, n_segments, result.size(), params.audio_ctx);
 
-    return env->NewStringUTF(result.c_str());
+    // Last line of defence: NewStringUTF aborts the *process* on malformed
+    // input, so a decode that ends mid-character — which happens when a
+    // repetition loop hits the token cap — would kill the host app rather
+    // than degrade one caption. Hand JNI only well-formed UTF-8.
+    const std::string safe = subly::utf8::sanitize(result);
+    if (safe.size() != result.size()) {
+        LOGW("nativeTranscribe: dropped %zu malformed UTF-8 byte(s) before JNI",
+                result.size() - safe.size());
+    }
+    return env->NewStringUTF(safe.c_str());
 }
 
 JNIEXPORT jstring JNICALL

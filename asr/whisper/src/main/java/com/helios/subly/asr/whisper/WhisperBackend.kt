@@ -10,8 +10,15 @@ interface WhisperBackend {
     /**
      * @param vadModelPath ggml Silero VAD model path; empty disables the
      *   pre-transcribe speech gate.
+     * @param glossary optional decoding-prompt bias (hotwords/names); empty
+     *   disables prompt biasing.
      */
-    fun init(modelPath: String, targetLanguageCode: String, vadModelPath: String): Long
+    fun init(
+        modelPath: String,
+        targetLanguageCode: String,
+        vadModelPath: String,
+        glossary: String,
+    ): Long
 
     /**
      * @param gateWithVad run the Silero VAD gate before decoding. Pass `true`
@@ -30,8 +37,8 @@ interface WhisperBackend {
     companion object {
         val Jni: WhisperBackend = object : WhisperBackend {
             override fun isAvailable() = WhisperNative.isAvailable()
-            override fun init(modelPath: String, targetLanguageCode: String, vadModelPath: String) =
-                WhisperNative.nativeInit(modelPath, targetLanguageCode, vadModelPath)
+            override fun init(modelPath: String, targetLanguageCode: String, vadModelPath: String, glossary: String) =
+                WhisperNative.nativeInit(modelPath, targetLanguageCode, vadModelPath, glossary)
             override fun transcribe(handle: Long, pcm: FloatArray, sampleRateHz: Int, gateWithVad: Boolean) =
                 WhisperNative.nativeTranscribe(handle, pcm, sampleRateHz, gateWithVad)
             override fun lastDetectedLang(handle: Long) =

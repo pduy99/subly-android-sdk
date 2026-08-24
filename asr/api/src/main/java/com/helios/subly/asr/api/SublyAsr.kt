@@ -17,6 +17,16 @@ import kotlinx.coroutines.flow.Flow
 interface SublyAsr {
 
     /**
+     * Whether each [AsrResult.Final] is already a complete utterance/clause.
+     *
+     * Streaming, endpoint-based engines (e.g. sherpa-onnx) finalize on a
+     * trailing pause, so their finals can be emitted one-to-one. Engines that
+     * emit arbitrary chunks leave this `false` and have their finals pooled
+     * into sentences downstream.
+     */
+    val emitsCompleteUtterances: Boolean get() = false
+
+    /**
      * Transcribes a stream of raw audio frames into ASR results.
      *
      * ### Contract

@@ -13,6 +13,12 @@ import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 
+private fun CaptionEndpointTuning.Rule.toEndpointRule(): EndpointRule = EndpointRule(
+    mustContainNonSilence = mustContainNonSilence,
+    minTrailingSilence = minTrailingSilenceSec,
+    minUtteranceLength = minUtteranceLengthSec,
+)
+
 /**
  * Test seam over the sherpa-onnx (`com.k2fsa.sherpa.onnx.*`) Kotlin API.
  *
@@ -77,10 +83,12 @@ internal interface SherpaOnnxBackend {
  * in the AAR under `sdk/libs/`.
  *
  * Streaming-Zipformer-transducer wiring: we build the recognizer config
- * pointing at on-disk encoder/decoder/joiner/tokens, enable endpointing
- * with the tuning we want for "captions" (rule2 = 1.2 s trailing silence
- * after speech, rule3 = 20 s hard cap), and use `modified_beam_search`
- * which gives noticeably better WER than greedy for streaming Zipformer.
+ * pointing at on-disk encoder/decoder/joiner/tokens and enable endpointing
+ * with the caption tuning in [CaptionEndpointTuning].
+ *
+ * Decoding is `greedy_search`. `modified_beam_search` would likely lower
+ * WER, but it has not been measured on the accuracy benchmark — treat the
+ * switch as an open experiment, not a known win.
  *
  * Availability probe lazily loads the JNI; on `UnsatisfiedLinkError`
  * (e.g. wrong ABI), [isAvailable] returns `false` permanently and the
@@ -156,30 +164,13 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
                     featureDim = 80,
                 ),
                 ctcFstDecoderConfig = OnlineCtcFstDecoderConfig(),
-                // Endpoint tuning for captions: finalize on a short pause so
-                // each spoken sentence/clause becomes its own final quickly,
-                // instead of letting one utterance grow for 10-20 s (which
-                // made the live caption a giant reflowing block).
-                //  - rule1: long pure-silence guard (no speech yet).
-                //  - rule2: 0.8 s of trailing silence AFTER speech -> the main
-                //           driver of per-sentence finals.
-                //  - rule3: hard cap so a run-on never grows past ~10 s.
+                // Where one caption ends and the next begins. See
+                // CaptionEndpointTuning — in particular why every rule waits
+                // for a pause instead of cutting on elapsed time alone.
                 endpointConfig = EndpointConfig(
-                    rule1 = EndpointRule(
-                        mustContainNonSilence = false,
-                        minTrailingSilence = 2.0f,
-                        minUtteranceLength = 0f,
-                    ),
-                    rule2 = EndpointRule(
-                        mustContainNonSilence = true,
-                        minTrailingSilence = 0.8f,
-                        minUtteranceLength = 0f,
-                    ),
-                    rule3 = EndpointRule(
-                        mustContainNonSilence = false,
-                        minTrailingSilence = 0f,
-                        minUtteranceLength = 10f,
-                    ),
+                    rule1 = CaptionEndpointTuning.SILENCE_GUARD.toEndpointRule(),
+                    rule2 = CaptionEndpointTuning.SPEECH_PAUSE.toEndpointRule(),
+                    rule3 = CaptionEndpointTuning.RUN_ON_CAP.toEndpointRule(),
                 ),
                 enableEndpoint = true,
                 decodingMethod = "greedy_search",
