@@ -210,4 +210,42 @@ class SentenceExtractorTest {
         e.append("second chunk.")
         assertEquals(listOf("first chunk second chunk."), e.extractCompleted())
     }
+
+    // ---- De-overlap stitching (chunked ASR window overlap) ----------------
+
+    @Test
+    fun `multi-word overlap between appends is stripped`() {
+        val e = extractor()
+        e.append("the color of a USB port is commonly an indicator")
+        // Next window re-emits the carried tail "an indicator".
+        e.append("an indicator of both its speed and features.")
+        assertEquals(
+            listOf(
+                "the color of a USB port is commonly an indicator " +
+                        "of both its speed and features."
+            ),
+            e.extractCompleted()
+        )
+    }
+
+    @Test
+    fun `single-word overlap is preserved (too common to strip)`() {
+        val e = extractor()
+        e.append("I can get it")
+        e.append("it works fine.")
+        // Only a 1-word overlap: left intact (legitimate repeats are common).
+        assertEquals(listOf("I can get it it works fine."), e.extractCompleted())
+    }
+
+    @Test
+    fun `overlap is stripped even after the pool was drained`() {
+        val e = extractor()
+        e.append("That's USB 2. Tech guy.")
+        assertEquals(listOf("That's USB 2.", "Tech guy."), e.extractCompleted())
+        assertTrue(e.isEmpty)
+        // Adjacent window repeats the boundary phrase; pool is empty but the
+        // word history still suppresses the duplicate.
+        e.append("Tech guy? Alright.")
+        assertEquals(listOf("Alright."), e.extractCompleted())
+    }
 }

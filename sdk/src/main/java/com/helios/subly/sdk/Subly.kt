@@ -31,6 +31,7 @@ class Subly private constructor(
     private val asrEngineFactory: () -> SublyAsr,
     private val translatorFactory: () -> SublyTranslator,
     private val audioCaptureFactory: () -> AudioCapture,
+    private val restorePunctuation: Boolean,
 ) {
 
     /**
@@ -45,6 +46,7 @@ class Subly private constructor(
         audioCapture = audioCaptureFactory(),
         asrEngine = asrEngineFactory(),
         translationEngine = translatorFactory(),
+        restorePunctuation = restorePunctuation,
     )
 
     class Builder {
@@ -53,6 +55,7 @@ class Subly private constructor(
         private var audioCaptureFactory: () -> AudioCapture = {
             AudioPlayback(dataSource = AudioRecordDataSource())
         }
+        private var restorePunctuation: Boolean = true
 
         /** Required. Factory invoked once per session. */
         fun setAsrEngine(factory: () -> SublyAsr) = apply { asrEngineFactory = factory }
@@ -67,6 +70,32 @@ class Subly private constructor(
         fun setAudioCapture(factory: () -> AudioCapture) = apply { audioCaptureFactory = factory }
 
         /**
+         * Restore sentence-terminal punctuation and casing on engines that
+         * emit neither (Vosk, sherpa-onnx). **On by default.** Engines that
+         * already punctuate, such as Whisper, are unaffected.
+         *
+         * Beyond readability, this is what lets sentence assembly split at
+         * sentences at all: it only treats a boundary as complete when the
+         * text ends in a terminator, so unpunctuated input leaves captions
+         * breaking wherever the recogniser happened to endpoint.
+         *
+         * Measured on the accuracy benchmark: readability rose sharply on
+         * Chinese (25 -> 82), where the recordings are separate utterances and
+         * an endpoint really is a sentence end.
+         *
+         * The known failure mode is continuous prose. A speaker pausing for
+         * breath mid-clause gets a period written there — "reference to its.
+         * capacity". Whether that costs more than the punctuation gains is
+         * unresolved: the English cells measured -7 and +5, both inside the
+         * judge's noise floor, on a pipeline that has since had two bugs fixed
+         * (a truncated playback window and mid-word caption splits). Turn it
+         * off if your audio is continuous speech and the mid-clause periods
+         * bother you more than the missing ones.
+         */
+        fun setPunctuationRestoration(enabled: Boolean) =
+            apply { restorePunctuation = enabled }
+
+        /**
          * @throws IllegalArgumentException with an actionable message when a
          * required component is missing — never a bare NPE.
          */
@@ -78,6 +107,7 @@ class Subly private constructor(
                 "A translator is required. Call setTranslator { ... } before build()."
             },
             audioCaptureFactory = audioCaptureFactory,
+            restorePunctuation = restorePunctuation,
         )
     }
 }

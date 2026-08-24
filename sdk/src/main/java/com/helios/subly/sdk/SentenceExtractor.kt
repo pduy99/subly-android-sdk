@@ -34,17 +34,78 @@ internal class SentenceExtractor(
     private val pool = StringBuilder()
     private val boundary: BreakIterator = BreakIterator.getSentenceInstance(locale)
 
+    /**
+     * Rolling record of the last [OVERLAP_WORDS] words appended (post-strip),
+     * independent of the pool so de-overlap still works after a sentence has
+     * been extracted and the pool drained. Used only for overlap detection.
+     */
+    private val recentWords = ArrayDeque<String>()
+
     val isEmpty: Boolean get() = pool.isBlank()
 
     /** Current pooled (incomplete) text — used as context for partials. */
     fun pending(): String = pool.toString().trim()
 
     fun append(chunk: String) {
-        val trimmed = chunk.trim()
+        val trimmed = stripLeadingOverlap(chunk.trim())
         if (trimmed.isEmpty()) return
         if (pool.isNotEmpty() && !pool.endsWith(" ")) pool.append(' ')
         pool.append(trimmed)
+        rememberTail(trimmed)
     }
+
+    /**
+     * Removes any leading words of [chunk] that duplicate the most recently
+     * appended words. Chunked ASR (whisper) re-emits the overlap tail carried
+     * across a max-length segment cut, and adjacent windows repeat boundary
+     * phrases — both surface as the same words appearing at the end of one
+     * final and the start of the next ("Tech guy. Tech guy?"). Collapsing them
+     * here keeps the duplication out of the captions and the translator.
+     *
+     * Only multi-word overlaps (>= [MIN_OVERLAP_WORDS]) are stripped: a single
+     * shared word is too common (legitimate repeats like "very very") to treat
+     * as an artifact.
+     */
+    private fun stripLeadingOverlap(chunk: String): String {
+        if (chunk.isEmpty() || recentWords.isEmpty()) return chunk
+        val chunkWords = WORD.findAll(chunk).toList()
+        if (chunkWords.isEmpty()) return chunk
+
+        val maxK = minOf(OVERLAP_WORDS, recentWords.size, chunkWords.size)
+        var matchedK = 0
+        for (k in maxK downTo MIN_OVERLAP_WORDS) {
+            val tail = recentWords.subList(recentWords.size - k, recentWords.size)
+            var same = true
+            for (i in 0 until k) {
+                if (!wordsEqual(tail[i], chunkWords[i].value)) {
+                    same = false
+                    break
+                }
+            }
+            if (same) {
+                matchedK = k
+                break
+            }
+        }
+        if (matchedK == 0) return chunk
+        // Drop the matched prefix; resume at the first word past it.
+        val firstKept = chunkWords.getOrNull(matchedK) ?: return ""
+        return chunk.substring(firstKept.range.first)
+    }
+
+    private fun rememberTail(text: String) {
+        for (m in WORD.findAll(text)) recentWords.addLast(m.value)
+        while (recentWords.size > OVERLAP_WORDS) recentWords.removeFirst()
+    }
+
+    /** Case/punctuation-insensitive word match for overlap detection. */
+    private fun wordsEqual(a: String, b: String): Boolean {
+        val na = normalizeWord(a)
+        return na.isNotEmpty() && na == normalizeWord(b)
+    }
+
+    private fun normalizeWord(w: String): String =
+        w.lowercase(Locale.ROOT).trim { !it.isLetterOrDigit() }
 
     /**
      * Removes and returns all complete sentences currently in the pool.
@@ -117,7 +178,7 @@ internal class SentenceExtractor(
         return null
     }
 
-    private companion object {
+    internal companion object {
         /**
          * Includes CJK full-width terminators ('。', '！', '？', '．') —
          * without them, Japanese/Chinese sentences never counted as complete
@@ -141,5 +202,14 @@ internal class SentenceExtractor(
          */
         const val MAX_WORDS_PER_SENTENCE = 28
         const val MIN_WORDS_BEFORE_COMMA_CUT = 5
+
+        /** Words of trailing history kept for de-overlap stitching. */
+        const val OVERLAP_WORDS = 12
+
+        /**
+         * Minimum overlap length (words) that counts as a stitch artifact.
+         * A single shared word is too common (legitimate repeats) to strip.
+         */
+        const val MIN_OVERLAP_WORDS = 2
     }
 }

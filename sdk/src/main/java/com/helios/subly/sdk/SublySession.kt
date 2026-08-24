@@ -1,9 +1,12 @@
 package com.helios.subly.sdk
 
 import android.media.projection.MediaProjection
+import androidx.annotation.VisibleForTesting
 import com.helios.subly.asr.api.SublyAsr
 import com.helios.subly.audio.api.AudioCapture
+import com.helios.subly.audio.api.ProjectionlessAudioCapture
 import com.helios.subly.core.model.AsrResult
+import com.helios.subly.core.model.AudioFrame
 import com.helios.subly.core.model.Caption
 import com.helios.subly.core.model.EngineState
 import com.helios.subly.core.model.LanguageConfig
@@ -19,6 +22,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -65,7 +69,12 @@ class SublySession internal constructor(
     private val audioCapture: AudioCapture,
     private val asrEngine: SublyAsr,
     private val translationEngine: SublyTranslator,
+    restorePunctuation: Boolean = true,
 ) : AutoCloseable {
+
+    /** Null when disabled — ASR text then reaches the extractor untouched. */
+    private val punctuation: PunctuationRestorer? =
+        if (restorePunctuation) PunctuationRestorer(config.source) else null
 
     private val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -110,6 +119,31 @@ class SublySession internal constructor(
      */
     @Synchronized
     fun start(mediaProjection: MediaProjection) {
+        startWith { audioCapture.frames(mediaProjection) }
+    }
+
+    /**
+     * Starts the pipeline without a `MediaProjection` token. Only valid when
+     * the installed capture is a [ProjectionlessAudioCapture] (file decoders,
+     * fakes) — the default system-audio capture is not.
+     *
+     * Same semantics as [start] otherwise.
+     *
+     * @throws IllegalStateException if the session is closed, or if the
+     *   installed [AudioCapture] requires a projection token.
+     */
+    @VisibleForTesting
+    @Synchronized
+    fun start() {
+        val capture = audioCapture as? ProjectionlessAudioCapture ?: throw IllegalStateException(
+            "The installed AudioCapture requires a MediaProjection — call " +
+                "start(mediaProjection), or install a ProjectionlessAudioCapture " +
+                "via Subly.Builder.setAudioCapture { ... }."
+        )
+        startWith { capture.frames() }
+    }
+
+    private fun startWith(frames: () -> Flow<AudioFrame>) {
         checkNotClosed()
         if (pipelineJob?.isActive == true) return
         prepare()
@@ -119,7 +153,7 @@ class SublySession internal constructor(
             if (_state.value !is EngineState.Ready) return@launch // error already on [state]
 
             _state.value = EngineState.Running
-            runPipeline(mediaProjection)
+            runPipeline(frames())
         }
     }
 
@@ -257,7 +291,7 @@ class SublySession internal constructor(
     // Pipeline
     // -------------------------------------------------------------------------
 
-    private suspend fun runPipeline(mediaProjection: MediaProjection) {
+    private suspend fun runPipeline(frames: Flow<AudioFrame>) {
         val extractor = SentenceExtractor(Locale.forLanguageTag(config.source))
         val extractorMutex = Mutex()
         resetPartialThrottle()
@@ -266,7 +300,7 @@ class SublySession internal constructor(
         channelFlow {
             var flushJob: Job? = null
 
-            asrEngine.transcribe(audioCapture.frames(mediaProjection))
+            asrEngine.transcribe(frames)
                 .collect { asrResult ->
                     when (asrResult) {
                         is AsrResult.Partial -> {
@@ -281,7 +315,11 @@ class SublySession internal constructor(
                         }
 
                         is AsrResult.Final -> {
-                            val finalChunk = asrResult.text.trim()
+                            // Restore before pooling: the extractor splits on
+                            // terminators, so punctuating here is what lets it
+                            // break at sentences instead of at endpoints.
+                            val finalChunk = punctuation?.restore(asrResult.text)
+                                ?: asrResult.text.trim()
                             if (finalChunk.isEmpty()) return@collect
 
                             flushJob?.cancel()
@@ -314,6 +352,21 @@ class SublySession internal constructor(
                         }
                     }
                 }
+
+            // End of audio. The idle flush above is a 3 s timer, so it only
+            // rescues the pooled remainder when the speaker happens to fall
+            // silent for 3 s before the stream ends — otherwise the block
+            // below returns, the channel closes, and the tail is dropped.
+            // With engines that emit no terminators (sherpa, vosk) the pool
+            // is non-empty almost every time, so this was silently losing the
+            // last caption of most sessions: on a 65 s benchmark clip it cost
+            // the final 268 characters, a third of a minute of speech.
+            flushJob?.cancel()
+            val tail = extractorMutex.withLock { extractor.drain() }
+            if (tail.isNotEmpty() && !isDuplicateFinal(tail)) {
+                BenchLog.metric("sentence_flush_eos len=${tail.length}")
+                send(buildFinalCaption(tail, kind = "flush"))
+            }
         }
             .catch { e ->
                 if (e is CancellationException) throw e
@@ -442,15 +495,38 @@ class SublySession internal constructor(
      * legitimately repeat themselves — but two *finalized captions* back to
      * back are never useful). Dropping here also saves the duplicate
      * translation call.
+     *
+     * Backstop to the [SentenceExtractor] de-overlap: that strips word-level
+     * overlap *within* the pool, but whole-sentence repeats that survive
+     * (e.g. one window ending a sentence and the next re-decoding it under the
+     * audio overlap) are caught here. Matching is normalized (case- and
+     * punctuation-insensitive) and also fires when one of the two fully
+     * contains the other, so near-duplicates collapse too.
      */
     private fun isDuplicateFinal(sentence: String): Boolean {
-        if (sentence.equals(lastFinalOriginal, ignoreCase = true)) {
+        val now = normalizeForDedupe(sentence)
+        val prev = normalizeForDedupe(lastFinalOriginal)
+        val duplicate = now.isNotEmpty() && prev.isNotEmpty() &&
+            (now == prev ||
+                (now.length >= DEDUPE_MIN_CONTAIN_LEN && prev.contains(now)) ||
+                (prev.length >= DEDUPE_MIN_CONTAIN_LEN && now.contains(prev)))
+        if (duplicate) {
             BenchLog.metric("caption_dedupe len=${sentence.length}")
+            // Keep the longer/newer form as the reference so a growing repeat
+            // doesn't keep matching the shortest seen variant.
+            if (now.length >= prev.length) lastFinalOriginal = sentence
             return true
         }
         lastFinalOriginal = sentence
         return false
     }
+
+    /** Lowercase, strip punctuation, collapse whitespace for dedupe compares. */
+    private fun normalizeForDedupe(text: String): String =
+        text.lowercase(Locale.forLanguageTag(config.source))
+            .replace(NON_ALNUM, " ")
+            .trim()
+            .replace(MULTI_SPACE, " ")
 
     private suspend fun buildFinalCaption(sentence: String, kind: String): Caption =
         Caption(
@@ -504,6 +580,17 @@ class SublySession internal constructor(
 
         /** Pool remainder is flushed as a final this long after the last ASR final. */
         const val IDLE_FLUSH_MS = 3_000L
+
+        /** Regexes/threshold for normalized near-duplicate final detection. */
+        val NON_ALNUM = Regex("[^\\p{L}\\p{N}]+")
+        val MULTI_SPACE = Regex("\\s+")
+
+        /**
+         * Containment-based dedupe only fires when the contained string is at
+         * least this many normalized chars — short fragments ("yes", "okay")
+         * are legitimately repeated and substrings of many sentences.
+         */
+        const val DEDUPE_MIN_CONTAIN_LEN = 12
 
         /** Re-translate a partial only if it grew by this many chars… */
         const val PARTIAL_RETRANSLATE_MIN_GROWTH = 12
