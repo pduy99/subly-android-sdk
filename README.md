@@ -5,7 +5,8 @@ On-device, real-time speech captioning and translation for Android. Subly captur
 ```
 System audio ──▶ Capture ──▶ ASR engine ──▶ Sentence assembly ──▶ Translator ──▶ Caption stream
                               (Sherpa /                            (ML Kit)
-                               Whisper)
+                               Whisper /
+                               Vosk)
 ```
 
 ---
@@ -35,6 +36,7 @@ includeBuild("../subly-android-sdk") {
         substitute(module("com.helios.subly.sdk:core")).using(project(":sdk"))
         substitute(module("com.helios.subly.asr:sherpa-onnx")).using(project(":asr:sherpa"))
         substitute(module("com.helios.subly.asr:whisper")).using(project(":asr:whisper"))
+        substitute(module("com.helios.subly.asr:vosk")).using(project(":asr:vosk"))
         substitute(module("com.helios.subly.translator:mlkit")).using(project(":translator:mlkit"))
     }
 }
@@ -49,6 +51,7 @@ dependencies {
     // Pick at least one ASR engine:
     implementation("com.helios.subly.asr:sherpa-onnx:0.0.1") // streaming, partial results
     implementation("com.helios.subly.asr:whisper:0.0.1")     // chunked, higher accuracy
+    implementation("com.helios.subly.asr:vosk:0.0.1")        // streaming, tiny footprint, 18 languages
 
     // Translator:
     implementation("com.helios.subly.translator:mlkit:0.0.1")
@@ -155,24 +158,104 @@ Don't drive your overlay from `state`, and don't infer engine health from `capti
 ### Partial vs final captions
 
 - `Caption(isFinal = false)` — a live hypothesis for the sentence in progress. **Replace** the currently displayed partial with each new one; never append.
-- `Caption(isFinal = true)` — a completed sentence. Safe to append to history / persist. Sentences are finalized on punctuation or after 20 words, whichever comes first.
+- `Caption(isFinal = true)` — a completed unit, safe to append to history / persist. How finals are formed depends on the engine: streaming engines (Sherpa) emit each endpoint utterance one-to-one for the lowest latency, while chunked engines (Whisper) and the other pooled engines assemble finals into complete sentences first — finalized on punctuation or after 28 words, whichever comes first.
 
-Note: both engines emit partials + finals. Sherpa partials arrive at ~200 ms cadence; Whisper partials are re-transcriptions of the utterance-in-progress emitted every ~800 ms of speech. Build your overlay to handle both shapes.
+Note: all three engines emit partials + finals. Sherpa and Vosk partials arrive at a ~200 ms cadence (Vosk debounced); Whisper partials are re-transcriptions of the utterance-in-progress emitted every ~800 ms of speech. Build your overlay to handle both shapes.
+
+Sherpa endpointing is tuned for captions: it finalizes after ~0.8 s of trailing silence (per spoken sentence/clause) with a ~10 s hard cap, so finals arrive every few seconds instead of letting one utterance grow for 10–20 s. Tune the `EndpointRule` values in `SherpaOnnxBackend` if you want longer or shorter segments.
+
+Partial translation is **tail-only**: the session freezes the completed-sentence prefix of a partial (translating it once and caching it) and only re-translates the trailing in-progress clause. This keeps already-spoken text from reflowing under the reader as machine translation re-orders words with new context, and avoids re-translating the whole growing block each tick.
 
 ---
 
 ## Choosing an ASR engine
 
-| | `SherpaOnnxTranscriber` | `WhisperTranscriber` |
-|---|---|---|
-| Style | Streaming | Chunked (VAD-segmented windows + in-progress partials) |
-| Partial results | ✅ ~200 ms cadence | ✅ ~800 ms cadence (growing-window re-transcription) |
-| Perceived latency | Lower | Low-moderate (first partial ≥ ~1.3 s into an utterance) |
-| Accuracy | Good | Better, esp. noisy audio / accents |
-| Model delivery | Provided by your app: bundle under `assets/sherpa-onnx/<model>/` or download into app storage | Downloaded on first prepare (~57 MB q5_1, Hugging Face) |
-| Best for | Live conversation feel | Accuracy-first captioning |
+| | `SherpaOnnxTranscriber` | `WhisperTranscriber` | `VoskTranscriber` |
+|---|---|---|---|
+| Style | Streaming | Chunked (VAD-segmented windows + in-progress partials) | Streaming (Kaldi nnet3) |
+| Partial results | ✅ ~200 ms cadence | ✅ ~800 ms cadence (growing-window re-transcription) | ✅ ~200 ms cadence (debounced) |
+| Perceived latency | Lower | Low-moderate (first partial ≥ ~1.3 s into an utterance) | Lower (~0.15 s right context) |
+| Accuracy | Good | Better, esp. noisy audio / accents | Fair (older Kaldi models; behind Zipformer) |
+| Model delivery | Downloaded on first prepare (~90 MB int8 Zipformer, Hugging Face), or app-bundled assets if present | Downloaded on first prepare (~57 MB q5_1 model + ~0.9 MB Silero VAD, Hugging Face) | Downloaded + unzipped on first prepare (~30-50 MB small model, alphacephei.com) |
+| Punctuation/casing | None (lowercase, unpunctuated) | Emitted by the model directly | None (lowercase, unpunctuated) |
+| Non-speech handling | Streaming model is naturally robust to gaps | Three-layer guard rejects music/noise (see below) | Built-in Kaldi endpointing |
+| Languages | en | en | 18 languages (en, en-in, zh, ru, fr, de, es, pt, tr, vi, it, nl, ca, ja, ko, hi, pl, uk) |
+| Best for | Live conversation feel | Accuracy-first captioning | Tiny footprint / broad language coverage on low-end devices |
 
-Both implement `SublyAsr`, so switching is a one-line change in the builder. If you let users toggle engines at runtime, rebuild `Subly` with the other factory and create a new session.
+Add the engine you want to your app's dependencies (Vosk is a normal Maven
+artifact — unlike sherpa it needs no app-side AAR wiring):
+
+```kotlin
+implementation("com.helios.subly.asr:vosk:0.0.1")
+```
+
+```kotlin
+val subly = Subly.Builder()
+    .setAsrEngine { VoskTranscriber(context) }   // picks the model from the session's source language
+    .setTranslator { MlKitTranslator() }
+    .build()
+```
+
+### Vosk model provisioning
+
+`VoskTranscriber` resolves `LanguageConfig.source` to a `vosk-model-small-*`
+build (see `VoskModels`), downloads the `.zip` from alphacephei.com on first
+`prepare()`, and unpacks it into `filesDir/vosk/<name>/` (flattening the zip's
+wrapper folder into the Kaldi `am/ conf/ graph/ ivector/` layout). Already-present
+models are reused; an unsupported source language fails `prepare()` with
+`IllegalArgumentException` listing the supported tags. Repoint
+`VoskModels.DOWNLOAD_BASE_URL` at your own mirror for production, and bump a
+model version in the same enum — it's the single source of truth. Output is
+lowercase and unpunctuated, so finals lean on the SDK's word-count cap for
+sentence assembly.
+
+### Sherpa model provisioning
+
+`prepareModel` makes the streaming Zipformer available in priority order:
+on-disk (already downloaded) → unpack an app-bundled copy under
+`assets/sherpa-onnx/<dirName>/` → download the int8 model files from Hugging
+Face into app storage. int8 builds are the default (≈4× smaller and faster
+than fp32 for a negligible WER cost); the backend resolves whichever
+encoder/decoder/joiner `.onnx` files are present, preferring int8, so a bundled
+fp32 copy works too.
+
+Sherpa is a pure streaming engine: its output is **lowercase and unpunctuated**
+by design — no punctuation/casing restoration runs. It also reports
+`emitsCompleteUtterances = true`, so the session streams each endpoint final
+one-to-one (translated and shown as-is) instead of pooling finals into
+sentences — the lowest-latency path, and the reason the punctuation-based
+sentence assembly is bypassed for this engine. Model source URLs live in
+`SherpaOnnxModel`; repoint `downloadBaseUrl` at your own mirror for production.
+
+### Non-speech rejection (Whisper)
+
+Whisper is trained to always emit text, so background music, applause, or
+steady noise make it hallucinate captions. The Whisper engine drops non-speech
+windows through three layers, cheapest first:
+
+1. **Silero VAD gate** — a small neural speech detector (`ggml-silero-v5.1.2.bin`,
+   ~0.9 MB, downloaded on first prepare) runs *before* transcription. The
+   upstream amplitude segmenter only knows loud-vs-quiet and can't tell speech
+   from music; the VAD can. Windows with no speech frame above the threshold
+   are dropped without paying for a Whisper decode (`vad_drop` benchmark line).
+   The gate runs on **final windows only** — partials grow every ~800 ms and
+   re-scanning the whole (up to 5 s) window each time added up to ~1 s of
+   overhead on the hot path, while the VAD effectively always passes during
+   real speech. Partials rely on layers 2–3 below, which run regardless.
+2. **No-speech probability** — Whisper's own per-segment estimate; high values
+   are dropped.
+3. **Average token log-probability** — confidence of the decoded text. Music
+   and noise hallucinations are usually low-confidence even when they slip past
+   layers 1–2.
+
+Layers 2–3 drop a window on *either* signal and emit a `no_speech_drop` line
+with `reason=no_speech|low_conf`. Tune the thresholds (`VAD_SPEECH_PROB`,
+`NO_SPEECH_THRESHOLD`, `AVG_LOGPROB_THRESHOLD`) in `whisper-jni.cpp`: raise
+`VAD_SPEECH_PROB` if music still leaks; lower it (or make `AVG_LOGPROB_THRESHOLD`
+more negative) if quiet/soft speech is being dropped. The VAD is optional — if
+its model fails to download, prepare still succeeds and only layers 2–3 run.
+
+All three engines implement `SublyAsr`, so switching is a one-line change in the builder. If you let users toggle engines at runtime, rebuild `Subly` with the other factory and create a new session.
 
 ### Translator notes (`MlKitTranslator`)
 
@@ -255,8 +338,9 @@ adb logcat -s SublyBench
 | `warmup` | JNI, once per init | `ms` — one-off graph allocation absorbed during prepare |
 | `whisper_full` | JNI, per inference | `audio_ms`, `infer_ms`, `rtf`, `audio_ctx`, `threads`, `encode_ms`, `decode_ms` |
 | `asr_window` | transcriber, per window | `kind` (partial/final), `queue_ms`, `infer_ms`, `e2e_ms`, `rtf`, `skipped`, `text_len`, `raw_len` |
-| `segment close` | VAD segmenter | `segment_ms`, `close_wait_ms`, `partials`, `kept`, `reason` (silence/max) |
-| `no_speech_drop` | JNI | window discarded as non-speech (`prob`, `audio_ms`) |
+| `segment close` | amplitude segmenter | `segment_ms`, `close_wait_ms`, `partials`, `kept`, `reason` (silence/max) |
+| `vad_pass` / `vad_drop` | JNI | Silero VAD gate result before decode (`max_prob`, `audio_ms`, `vad_ms`) |
+| `no_speech_drop` | JNI | window discarded post-decode (`prob`, `avg_logprob`, `reason` (no_speech/low_conf), `audio_ms`) |
 | `translate` | session, per MT call | `kind` (partial/final/flush), `ms`, `src_len`, `dst_len`, `ok` |
 | `translate_skip` | session | partial re-translation throttled (`reason`) |
 | `translate_warmup` | session, once per prepare | first ML Kit call absorbed during prepare (`ms`, `ok`) |
@@ -290,29 +374,8 @@ While enabled, each window also logs `transcript kind=... text="..."` (including
 | State reaches `Running` but no captions | Source app is DRM-protected, or device volume routing excludes capture | Test with a non-DRM source (e.g. YouTube) |
 | `IllegalStateException: ... not prepared` from an engine | `transcribe` collected before `Ready` — only possible when bypassing `SublySession` | Drive engines through a session, or await `Ready` yourself |
 | Garbled/empty Whisper output + `SAMPLE RATE MISMATCH` in logcat | Capture not delivering 16 kHz audio | Ensure the capture path resamples to 16 kHz |
+| Whisper captions hallucinate over music/noise | Non-speech leaking past the guards | Check `vad_drop`/`no_speech_drop` lines; raise `VAD_SPEECH_PROB` in `whisper-jni.cpp`. If no `vad_*` lines appear, the VAD model didn't download — captions fall back to layers 2–3 only |
+| Real speech intermittently dropped | Guards too aggressive | Lower `VAD_SPEECH_PROB` or make `AVG_LOGPROB_THRESHOLD` more negative |
 | Partial captions flicker | Overlay appends partials instead of replacing | Replace the displayed partial; append only `isFinal == true` |
 
 ---
-
-## API at a glance
-
-```kotlin
-class Subly {
-    fun createSession(config: LanguageConfig): SublySession
-    class Builder {
-        fun setAsrEngine(factory: () -> SublyAsr): Builder      // required
-        fun setTranslator(factory: () -> SublyTranslator): Builder // required
-        fun setAudioCapture(factory: () -> AudioCapture): Builder  // optional (tests)
-        fun build(): Subly
-    }
-}
-
-class SublySession : AutoCloseable {
-    val state: StateFlow<EngineState>
-    val captions: SharedFlow<Caption>
-    fun prepare()                              // idempotent; retries after Error
-    fun start(mediaProjection: MediaProjection)
-    fun stop()                                 // keeps models warm
-    override fun close()                       // terminal
-}
-```
