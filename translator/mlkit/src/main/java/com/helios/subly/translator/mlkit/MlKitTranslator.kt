@@ -9,6 +9,7 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import com.helios.subly.core.model.LanguageConfig
 import com.helios.subly.core.model.ModelPrepState
 import com.helios.subly.translator.api.SublyTranslator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.tasks.await
@@ -71,6 +72,12 @@ class MlKitTranslator(
             activeTranslator?.downloadModelIfNeeded(downloadConditions)?.await()
 
             emit(ModelPrepState.Ready)
+        } catch (e: CancellationException) {
+            // Terminal operators (`first {}`, `take()`) stop a flow by throwing
+            // AbortFlowException, a CancellationException. Catching it and
+            // emitting again violates flow exception transparency and crashes
+            // the collector, so cancellation must pass straight through.
+            throw e
         } catch (e: Exception) {
             emit(ModelPrepState.Error(e))
         }
