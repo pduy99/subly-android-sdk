@@ -116,3 +116,4 @@ replay_pid*.log
 **/dokka/
 **/javadoc/
 docs/build/
+/reports/
