@@ -76,6 +76,10 @@ class SublySession internal constructor(
     private val punctuation: PunctuationRestorer? =
         if (restorePunctuation) PunctuationRestorer(config.source) else null
 
+    // Independent of restorePunctuation: an inter-word space in Chinese or
+    // Japanese is a recogniser artefact either way, not a formatting choice.
+    private val cjkSpacing = CjkSpacing(config.source)
+
     private val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val _state = MutableStateFlow<EngineState>(EngineState.Idle)
@@ -311,15 +315,17 @@ class SublySession internal constructor(
                             // aren't split.
                             flushJob?.cancel()
                             val pending = extractorMutex.withLock { extractor.pending() }
-                            processPartialResult(pending, asrResult.text)?.let { send(it) }
+                            processPartialResult(
+                                pending, cjkSpacing.collapse(asrResult.text),
+                            )?.let { send(it) }
                         }
 
                         is AsrResult.Final -> {
                             // Restore before pooling: the extractor splits on
                             // terminators, so punctuating here is what lets it
                             // break at sentences instead of at endpoints.
-                            val finalChunk = punctuation?.restore(asrResult.text)
-                                ?: asrResult.text.trim()
+                            val spaced = cjkSpacing.collapse(asrResult.text)
+                            val finalChunk = punctuation?.restore(spaced) ?: spaced.trim()
                             if (finalChunk.isEmpty()) return@collect
 
                             flushJob?.cancel()
