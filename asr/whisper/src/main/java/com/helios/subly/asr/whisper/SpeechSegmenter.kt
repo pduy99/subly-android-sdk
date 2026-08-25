@@ -109,11 +109,19 @@ class SpeechSegmenter(
                                 "partials=$partialsEmitted kept=$kept start_ts=$segmentStartMs " +
                                 "thr=${gate!!.threshold} floor=${gate!!.noiseFloor}"
                     )
+                    // Cut at the cap with the speaker still going: the
+                    // utterance runs on into the next window.
+                    val continues = maxReached && maxOverlapMs > 0
                     if (kept) {
-                        emit(Window(segment.toFloatArray(), sampleRate, segmentStartMs, isFinal = true))
+                        emit(
+                            Window(
+                                segment.toFloatArray(), sampleRate, segmentStartMs,
+                                isFinal = true, continuesUtterance = continues,
+                            )
+                        )
                     }
 
-                    if (maxReached && maxOverlapMs > 0) {
+                    if (continues) {
                         // Force-closed mid-utterance at the length cap. Carry the
                         // tail of the audio into the next window as left-context
                         // so the word straddling the cut is decoded whole rather
@@ -367,6 +375,14 @@ class SpeechSegmenter(
         val startTimestampMs: Long,
         /** True for a closed utterance; false for an in-progress hypothesis. */
         val isFinal: Boolean = true,
+        /**
+         * True when this window was cut at [MAX_SEGMENT_MS] with the speaker
+         * still going, so the utterance continues in the next window. Whisper
+         * punctuates every window as though it were a whole sentence, and
+         * downstream that full stop is a lie — the consumer uses this to tell
+         * a real sentence end from the length cap firing mid-clause.
+         */
+        val continuesUtterance: Boolean = false,
         /**
          * [System.nanoTime] at emission. Lets the consumer measure how long
          * a window sat queued before inference (benchmark only; excluded

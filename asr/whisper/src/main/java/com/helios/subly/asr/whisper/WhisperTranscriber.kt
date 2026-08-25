@@ -193,7 +193,19 @@ class WhisperTranscriber(
                 val inferMs = (System.nanoTime() - inferStartNanos) / 1_000_000
                 // Collapse repetition-loop hallucinations; the first
                 // occurrence of the looped phrase is the real transcription.
-                val text = RepetitionFilter.collapse(rawText)
+                var text = RepetitionFilter.collapse(rawText)
+
+                // Whisper punctuates every window as a complete sentence. When
+                // the segmenter cut this one at the length cap the speaker was
+                // still talking, so that full stop is an artefact of the cut —
+                // and downstream it does real damage: sentence assembly treats
+                // it as a boundary and capitalises the continuation, producing
+                // captions like "and then with clean wet." / "hands squeeze
+                // them into a ball." Drop it and let the real sentence end,
+                // when it arrives, be the one that splits the caption.
+                if (window.continuesUtterance && text.isNotEmpty()) {
+                    text = text.trimEnd().trimEnd(*MID_UTTERANCE_TRIM).trimEnd()
+                }
 
                 val lang = if (window.isFinal && text.isNotEmpty()) {
                     synchronized(nativeLock) {
@@ -328,5 +340,13 @@ class WhisperTranscriber(
         /** ggml Silero VAD model (~885 KB) on the `ggml-org/whisper-vad` repo. */
         const val DEFAULT_VAD_ASSET = "ggml-silero-v5.1.2.bin"
         private const val WHISPER_SAMPLE_RATE = 16_000
+
+        /**
+         * Sentence-final marks stripped from a window that was cut mid-
+         * utterance. Commas and other non-terminal marks are left alone —
+         * they do not end a sentence downstream, so they do no harm.
+         */
+        private val MID_UTTERANCE_TRIM =
+            charArrayOf('.', '!', '?', '…', '。', '！', '？', '．')
     }
 }

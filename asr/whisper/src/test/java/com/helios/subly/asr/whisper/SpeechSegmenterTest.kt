@@ -198,6 +198,32 @@ class SpeechSegmenterTest {
         assertEquals(1_000, gate.threshold)
     }
 
+    // -------------------------------------------------------------------------
+    // Mid-utterance cuts
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `marks a window cut at the length cap as continuing`() {
+        // 20 s of unbroken speech: every close is the cap firing, and the
+        // speaker never stopped, so every window continues.
+        var i = 0
+        val windows = segment(blocks = frames(400) { if (i++ % 5 < 3) tone(4_000) else tone(300) })
+
+        assertTrue("expected several capped windows", windows.size >= 3)
+        assertTrue("capped windows must be marked as continuing",
+            windows.dropLast(1).all { it.continuesUtterance })
+    }
+
+    @Test
+    fun `does not mark a window that closed on silence`() {
+        val windows = segment(blocks =
+            frames(20) { silence() } + frames(40) { tone(3_000) } + frames(20) { silence() }
+        )
+
+        assertEquals(1, windows.size)
+        assertTrue(!windows.single().continuesUtterance)
+    }
+
     private companion object {
         const val SAMPLE_RATE = 16_000
         const val FRAME_MS = 50
