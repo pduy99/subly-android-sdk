@@ -360,9 +360,24 @@ class SublySession internal constructor(
                             // sentence we'll ever get — emit it rather than
                             // stranding it (whisper finals frequently lack
                             // terminal punctuation).
+                            //
+                            // How long to wait depends on what the recogniser
+                            // just told us. After a final that ended a
+                            // sentence, silence means the speaker stopped. But
+                            // after one cut at the length cap the continuation
+                            // is already coming, and whisper's finals arrive a
+                            // median 4.2 s apart on this hardware — so a 3 s
+                            // timer fires first 76% of the time and emits half
+                            // a sentence as its own caption. That, not the
+                            // punctuation, was what kept whisper at 1.76
+                            // captions per reference sentence while the
+                            // streaming engines sat at 1.00.
+                            val idleMs =
+                                if (asrResult.endsSentence) IDLE_FLUSH_MS
+                                else CONTINUATION_FLUSH_MS
                             if (extractorMutex.withLock { !extractor.isEmpty }) {
                                 flushJob = launch {
-                                    delay(IDLE_FLUSH_MS)
+                                    delay(idleMs)
                                     val remainder = extractorMutex.withLock { extractor.drain() }
                                     if (remainder.isNotEmpty() && !isDuplicateFinal(remainder)) {
                                         BenchLog.metric("sentence_flush len=${remainder.length}")
@@ -601,6 +616,17 @@ class SublySession internal constructor(
 
         /** Pool remainder is flushed as a final this long after the last ASR final. */
         const val IDLE_FLUSH_MS = 3_000L
+
+        /**
+         * Idle timeout used instead of [IDLE_FLUSH_MS] when the recogniser
+         * reported that its last final did not end a sentence.
+         *
+         * Still bounded rather than infinite: if the continuation never
+         * arrives — the stream stalls, the decoder gives up — the pooled text
+         * must still reach the screen. Sized well past whisper's p90 gap of
+         * ~12 s so it is a genuine backstop and not a routine cutoff.
+         */
+        const val CONTINUATION_FLUSH_MS = 20_000L
 
         /** Regexes/threshold for normalized near-duplicate final detection. */
         val NON_ALNUM = Regex("[^\\p{L}\\p{N}]+")

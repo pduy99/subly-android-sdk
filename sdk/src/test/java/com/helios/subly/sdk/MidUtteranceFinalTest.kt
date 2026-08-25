@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -95,6 +96,49 @@ class MidUtteranceFinalTest {
         assertTrue(
             "the continuation must not be capitalised; got: $joined",
             !joined.contains("Hands squeeze"),
+        )
+    }
+
+    @Test
+    fun `a continuation is not flushed as its own caption before it arrives`() {
+        // Whisper's finals land a median 4.2 s apart on the benchmark device,
+        // so a 3 s idle timer emits the first half as a caption of its own.
+        // A final that reports endsSentence=false must hold the pool open.
+        val slowAsr = object : SublyAsr {
+            override fun transcribe(frames: Flow<AudioFrame>): Flow<AsrResult> = flow {
+                emit(AsrResult.Final("alloys are basically a mixture of two or more metals",
+                    endsSentence = false))
+                delay(4_500)   // longer than IDLE_FLUSH_MS, shorter than the backstop
+                emit(AsrResult.Final("that conduct electricity"))
+            }
+            override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> =
+                flowOf(ModelPrepState.Ready)
+            override fun release() = Unit
+            override fun supportedLanguages(): List<String> = listOf("en")
+        }
+
+        val captions = runBlocking {
+            val session = SublySession(
+                config = LanguageConfig(source = "en", target = "vi"),
+                audioCapture = FakeCapture(),
+                asrEngine = slowAsr,
+                translationEngine = EchoTranslator(),
+                restorePunctuation = true,
+            )
+            val out = mutableListOf<Caption>()
+            val collector = launch(Dispatchers.Default) { session.captions.collect { out += it } }
+            delay(200)
+            session.start()
+            delay(6_000)
+            collector.cancel()
+            session.close()
+            out.filter { it.isFinal }
+        }
+
+        val joined = captions.joinToString(" | ") { it.originalText }
+        assertTrue(
+            "the halves must arrive as one caption, not two; got: $joined",
+            captions.any { it.originalText.contains("metals that conduct electricity") },
         )
     }
 
