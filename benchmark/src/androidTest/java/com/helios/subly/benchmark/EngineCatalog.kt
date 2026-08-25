@@ -47,6 +47,12 @@ object EngineCatalog {
         // runs at roughly 3.2x real time — a 60 s clip is still being
         // transcribed long after playback ends.
         BenchmarkEngine("whisper", setOf("en", "zh", "ja"), quiescenceMs = 90_000) {
+            // Model capacity was measured, not assumed: large-v3-turbo-q5_0
+            // lifted CJK character agreement from 63%/58% to 80%/82% — and
+            // ran at RTF 12 on this device, 61 s of inference for a 5 s
+            // window. Accurate and unusable. The gap is real but it is not
+            // reachable in real time on 2019-class silicon, so the default
+            // stays at small-q5_1.
             WhisperTranscriber(it)
         },
         BenchmarkEngine("sherpa", setOf("en"), quiescenceMs = 20_000) {
