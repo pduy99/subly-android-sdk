@@ -323,15 +323,30 @@ class SublySession internal constructor(
                         is AsrResult.Final -> {
                             // Restore before pooling: the extractor splits on
                             // terminators, so punctuating here is what lets it
-                            // break at sentences instead of at endpoints.
+                            // break at sentences instead of at endpoints. Both
+                            // halves of that are conditional, for reasons the
+                            // captions make obvious when they are not:
+                            //  - a terminator on a window the length cap cut
+                            //    mid-utterance splits the caption mid-clause,
+                            //  - a capital on text that continues a pooled
+                            //    sentence reads as "with clean wet Hands
+                            //    squeeze them into a ball".
                             val spaced = cjkSpacing.collapse(asrResult.text)
-                            val finalChunk = punctuation?.restore(spaced) ?: spaced.trim()
-                            if (finalChunk.isEmpty()) return@collect
 
                             flushJob?.cancel()
                             resetPartialThrottle()
 
                             val sentences = extractorMutex.withLock {
+                                val startsSentence = extractor.pending().let {
+                                    it.isEmpty() ||
+                                        it.last() in SentenceExtractor.SENTENCE_TERMINATORS
+                                }
+                                val finalChunk = punctuation?.restore(
+                                    spaced,
+                                    addTerminator = asrResult.endsSentence,
+                                    capitalise = startsSentence,
+                                ) ?: spaced.trim()
+                                if (finalChunk.isEmpty()) return@withLock emptyList()
                                 extractor.append(finalChunk)
                                 extractor.extractCompleted()
                             }

@@ -206,6 +206,10 @@ class WhisperTranscriber(
                 if (window.continuesUtterance && text.isNotEmpty()) {
                     text = text.trimEnd().trimEnd(*MID_UTTERANCE_TRIM).trimEnd()
                 }
+                // The strip alone is not enough: PunctuationRestorer adds a
+                // terminator back to any final that lacks one, so the fact has
+                // to travel with the result rather than only shaping its text.
+                val endsSentence = !window.continuesUtterance
 
                 val lang = if (window.isFinal && text.isNotEmpty()) {
                     synchronized(nativeLock) {
@@ -236,7 +240,7 @@ class WhisperTranscriber(
                     if (window.isFinal) {
                         // NOTE: never log transcript content — it is end-user speech.
                         Log.d(TAG, "Whisper emitted final (length=${text.length}, lang='$lang')")
-                        send(AsrResult.Final(text))
+                        send(AsrResult.Final(text, endsSentence = endsSentence))
                     } else {
                         send(AsrResult.Partial(text))
                     }

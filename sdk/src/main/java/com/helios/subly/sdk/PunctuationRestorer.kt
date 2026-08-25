@@ -41,16 +41,27 @@ internal class PunctuationRestorer(languageTag: String) {
     private val terminator: Char = if (isUnspacedScript) '。' else '.'
 
     /**
+     * @param addTerminator false when the recogniser reports that the speaker
+     *   had not finished — a whisper window cut at its length cap. Adding a
+     *   full stop there makes sentence assembly break the caption mid-clause.
+     * @param capitalise false when this text continues a sentence already
+     *   pooled in the extractor, so the join does not read as
+     *   "with clean wet Hands squeeze them into a ball".
      * @return [text] with a sentence terminator and leading capital, or [text]
      *   unchanged when it is empty or already punctuated.
      */
-    fun restore(text: String): String {
+    fun restore(
+        text: String,
+        addTerminator: Boolean = true,
+        capitalise: Boolean = true,
+    ): String {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return trimmed
         if (trimmed.last() in SentenceExtractor.SENTENCE_TERMINATORS) return trimmed
 
-        val capitalised = if (isUnspacedScript) trimmed else capitaliseFirst(trimmed)
-        return capitalised + terminator
+        val cased =
+            if (capitalise && !isUnspacedScript) capitaliseFirst(trimmed) else trimmed
+        return if (addTerminator) cased + terminator else cased
     }
 
     /**
