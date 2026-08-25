@@ -381,7 +381,11 @@ class SublySession internal constructor(
                                     val remainder = extractorMutex.withLock { extractor.drain() }
                                     if (remainder.isNotEmpty() && !isDuplicateFinal(remainder)) {
                                         BenchLog.metric("sentence_flush len=${remainder.length}")
-                                        send(buildFinalCaption(remainder, kind = "flush"))
+                                        // Nothing more is coming for this
+                                        // sentence, so it does end here —
+                                        // terminate it rather than shipping a
+                                        // caption that trails off unpunctuated.
+                                        send(buildFinalCaption(terminate(remainder), kind = "flush"))
                                     }
                                 }
                             }
@@ -401,7 +405,7 @@ class SublySession internal constructor(
             val tail = extractorMutex.withLock { extractor.drain() }
             if (tail.isNotEmpty() && !isDuplicateFinal(tail)) {
                 BenchLog.metric("sentence_flush_eos len=${tail.length}")
-                send(buildFinalCaption(tail, kind = "flush"))
+                send(buildFinalCaption(terminate(tail), kind = "flush"))
             }
         }
             .catch { e ->
@@ -411,6 +415,14 @@ class SublySession internal constructor(
             }
             .collect { caption -> _captions.emit(caption) }
     }
+
+    /**
+     * Punctuates text being flushed from the pool. A flush means no further
+     * recognition is coming for this sentence, so it genuinely ends here even
+     * though the recogniser never said so.
+     */
+    private fun terminate(text: String): String =
+        punctuation?.restore(text, addTerminator = true, capitalise = false) ?: text
 
     // ---- Partial handling -------------------------------------------------
     //
@@ -621,12 +633,14 @@ class SublySession internal constructor(
          * Idle timeout used instead of [IDLE_FLUSH_MS] when the recogniser
          * reported that its last final did not end a sentence.
          *
-         * Still bounded rather than infinite: if the continuation never
-         * arrives — the stream stalls, the decoder gives up — the pooled text
-         * must still reach the screen. Sized well past whisper's p90 gap of
-         * ~12 s so it is a genuine backstop and not a routine cutoff.
+         * Sized just past whisper's p75 gap (6.6 s on the benchmark device),
+         * not its p90. Waiting for the p90 was measured and overshot: caption
+         * count fell to 0.5-0.8 per reference sentence, merging separate
+         * sentences into one over-long caption and delaying every one of them
+         * to the end of the stream. Beating the common gap is what joins a
+         * split sentence; waiting for the rare one just strands text.
          */
-        const val CONTINUATION_FLUSH_MS = 20_000L
+        const val CONTINUATION_FLUSH_MS = 7_000L
 
         /** Regexes/threshold for normalized near-duplicate final detection. */
         val NON_ALNUM = Regex("[^\\p{L}\\p{N}]+")
