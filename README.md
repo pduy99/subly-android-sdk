@@ -3,10 +3,10 @@
 On-device, real-time speech captioning and translation for Android. Subly captures system audio (via `MediaProjection`), transcribes it locally with a pluggable ASR engine, translates the result on-device, and streams ready-to-render captions to your app — no audio ever leaves the device.
 
 ```
-System audio ──▶ Capture ──▶ ASR engine ──▶ Sentence assembly ──▶ Translator ──▶ Caption stream
-                              (Sherpa /                            (ML Kit)
-                               Whisper /
-                               Vosk)
+System audio ──▶ Capture ──▶ Speech gate ──▶ ASR engine ──▶ Sentence assembly ──▶ Translator ──▶ Caption stream
+                             (Silero VAD)    (Sherpa /                            (ML Kit /
+                                              Whisper /                            LiteRT-LM)
+                                              Vosk)
 ```
 
 ---
@@ -38,6 +38,7 @@ includeBuild("../subly-android-sdk") {
         substitute(module("com.helios.subly.asr:whisper")).using(project(":asr:whisper"))
         substitute(module("com.helios.subly.asr:vosk")).using(project(":asr:vosk"))
         substitute(module("com.helios.subly.translator:mlkit")).using(project(":translator:mlkit"))
+        substitute(module("com.helios.subly.translator:litertlm")).using(project(":translator:litertlm"))
     }
 }
 ```
@@ -53,8 +54,9 @@ dependencies {
     implementation("com.helios.subly.asr:whisper:0.0.1")     // chunked, higher accuracy
     implementation("com.helios.subly.asr:vosk:0.0.1")        // streaming, tiny footprint, 18 languages
 
-    // Translator:
-    implementation("com.helios.subly.translator:mlkit:0.0.1")
+    // Pick a translator:
+    implementation("com.helios.subly.translator:mlkit:0.0.1")    // ~30 MB/pair, milliseconds
+    implementation("com.helios.subly.translator:litertlm:0.0.1") // ~1.6 GB LLM, seconds
 }
 ```
 
@@ -176,14 +178,17 @@ Partial translation is **tail-only**: the session freezes the completed-sentence
 | Partial results | ✅ ~200 ms cadence | ✅ ~800 ms cadence (growing-window re-transcription) | ✅ ~200 ms cadence (debounced) |
 | Perceived latency | Lower | Low-moderate (first partial ≥ ~1.3 s into an utterance) | Lower (~0.15 s right context) |
 | Accuracy | Good | Better, esp. noisy audio / accents | Fair (older Kaldi models; behind Zipformer) |
-| Model delivery | Downloaded on first prepare (~90 MB int8 Zipformer, Hugging Face), or app-bundled assets if present | Downloaded on first prepare (~57 MB q5_1 model + ~0.9 MB Silero VAD, Hugging Face) | Downloaded + unzipped on first prepare (~30-50 MB small model, alphacephei.com) |
+| Model delivery | Downloaded on first prepare (~90 MB int8 Zipformer, Hugging Face) + ~0.6 MB Silero VAD, or app-bundled assets if present | Downloaded on first prepare (~57 MB q5_1 model + ~0.9 MB Silero VAD, Hugging Face) | Downloaded + unzipped on first prepare (~30-50 MB small model, alphacephei.com) + ~0.6 MB Silero VAD |
 | Punctuation/casing | None (lowercase, unpunctuated) | Emitted by the model directly | None (lowercase, unpunctuated) |
-| Non-speech handling | Streaming model is naturally robust to gaps | Three-layer guard rejects music/noise (see below) | Built-in Kaldi endpointing |
+| Non-speech handling | Shared `SpeechGate` (see below) | Own in-JNI Silero gate + 2 post-decode guards (see below) | Shared `SpeechGate` (see below) |
 | Languages | en | en | 18 languages (en, en-in, zh, ru, fr, de, es, pt, tr, vi, it, nl, ca, ja, ko, hi, pl, uk) |
 | Best for | Live conversation feel | Accuracy-first captioning | Tiny footprint / broad language coverage on low-end devices |
 
-Add the engine you want to your app's dependencies (Vosk is a normal Maven
-artifact — unlike sherpa it needs no app-side AAR wiring):
+Add the engine you want to your app's dependencies. Vosk is a normal Maven
+artifact, so unlike sherpa it needs no app-side AAR wiring to transcribe —
+the one exception is the shared speech gate, which runs on the sherpa-onnx
+runtime. A vosk-only app builds and runs without the sherpa AAR and simply
+gets no gating; add the AAR the way the sherpa engine does to turn it on:
 
 ```kotlin
 implementation("com.helios.subly.asr:vosk:0.0.1")
@@ -227,11 +232,64 @@ sentences — the lowest-latency path, and the reason the punctuation-based
 sentence assembly is bypassed for this engine. Model source URLs live in
 `SherpaOnnxModel`; repoint `downloadBaseUrl` at your own mirror for production.
 
-### Non-speech rejection (Whisper)
+### Non-speech rejection
+
+Every ASR model will happily turn music, applause, or steady room noise into
+confident nonsense words. Two different mechanisms guard against that, because
+the streaming and chunked engines fail differently.
+
+#### The speech gate (Sherpa, Vosk)
+
+`SpeechGate` runs Silero VAD (`silero_vad.onnx`, ~0.6 MB, downloaded on first
+prepare) over the incoming audio and **replaces non-speech with digital
+silence** before the recogniser sees it.
+
+Muting rather than dropping is the load-bearing choice. Both engines decide
+where one caption ends by counting *trailing silence* — sherpa through
+`CaptionEndpointTuning`, Vosk through Kaldi's endpointing — so cutting the
+audio out would stop endpoints firing at all. Converting noise into silence
+does the opposite: a music passage now reads to the recogniser as exactly the
+thing that should end a caption.
+
+Two things stop it eating speech.
+
+It **looks ahead** ~128 ms. A gate that judges each 32 ms window on its own
+cannot help clipping onsets, because a verdict cannot be applied to audio
+already emitted — measured on the accuracy benchmark, an early version cost
+the first word of a caption at 25 of 64 caption boundaries (`記事の温度…` came
+back as `の温度…`, `Congress began…` as `Iris began…`). The gate therefore
+holds a few windows back and mutes one only when neither it nor the audio
+shortly after it is speech. The cost is a fixed ~128 ms of latency, a fifth of
+the endpoint delay the caption already waits through.
+
+It also **closes slowly** — only after 2.5 s of continuous non-speech, longer
+than the trailing silence any `CaptionEndpointTuning` rule asks for. An
+ordinary pause between two sentences therefore never closes it; only sustained
+non-speech does, which is the only thing it is for.
+
+One consequence of the delay line: `process()` does not return as many samples
+as it was given. Output is delayed and delivered in whole 32 ms windows, so
+early calls return less and later calls more. Nothing is lost — the ASR
+engines drain the remainder at end of stream.
+
+It fails open. No sherpa runtime in the app, wrong ABI, a checkpoint that
+never downloaded, a native call that threw — any of those leave the gate
+inactive and the audio untouched. A broken VAD costs accuracy, never a
+session. Pass `speechGate = null` to the transcriber to disable it outright,
+or construct your own `SpeechGate(context, threshold = …, closeAfterMs = …)`
+to retune it.
+
+Note that the gate runs on the sherpa-onnx runtime, so a Vosk-only app has to
+add the sherpa AAR to its runtime classpath to get it (see above).
+
+#### Post-decode guards (Whisper)
 
 Whisper is trained to always emit text, so background music, applause, or
 steady noise make it hallucinate captions. The Whisper engine drops non-speech
-windows through three layers, cheapest first:
+windows through three layers, cheapest first. It runs its own Silero copy
+inside `whisper-jni.cpp` rather than the shared `SpeechGate`: the gate above
+is a streaming mute, while Whisper needs a per-window *drop* so it never pays
+for the decode at all.
 
 1. **Silero VAD gate** — a small neural speech detector (`ggml-silero-v5.1.2.bin`,
    ~0.9 MB, downloaded on first prepare) runs *before* transcription. The
@@ -268,6 +326,62 @@ MlKitTranslator(
 ```
 
 - ML Kit doesn't report download progress; the translator's `Preparing` phase is indeterminate (constant `0f`). The session's aggregated `EngineState.Preparing.progress` still moves thanks to the ASR side.
+
+### Translator notes (`LiteRtLmTranslator`)
+
+An on-device LLM (Qwen2.5 1.5B Instruct, int8, ~1.6 GB) through
+[LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM), for when ML Kit's
+per-pair NMT output isn't good enough. Same `SublyTranslator` interface, so
+it is a one-line swap:
+
+```kotlin
+val subly = Subly.Builder()
+    .setAsrEngine { SherpaOnnxTranscriber(context) }
+    .setTranslator { LiteRtLmTranslator(context) }
+    .build()
+```
+
+What you are trading:
+
+| | `MlKitTranslator` | `LiteRtLmTranslator` |
+|---|---|---|
+| Download | ~30 MB per language | ~1.6 GB, once |
+| Per caption | tens of ms | seconds (device-dependent — measure it) |
+| Partial captions | translated live | **not translated** — see below |
+| Quality | per-pair NMT, sentence-blind | context-aware, handles idiom and register |
+| Licence | Google Play Services | model is Apache-2.0 |
+
+**Partials are not translated.** The translator reports
+`translatesPartials = false`, and the session honours it: partial captions
+still stream, but carry the *source* text as their translation until the
+sentence completes and the final goes through the LLM. This is not a
+limitation to work around — `SublySession` translates on the same coroutine
+that collects ASR results, so routing a multi-second call onto the ~200 ms
+partial cadence applies backpressure all the way back to audio capture. If
+you want live translated partials with LLM finals, install a composite
+`SublyTranslator` that delegates each to a different engine.
+
+Measure before shipping it. `LiteRtLmLatencyTest` in `:benchmark` reports
+prepare time and per-caption generation time on a real device:
+
+```
+./gradlew :benchmark:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=com.helios.subly.benchmark.LiteRtLmLatencyTest
+```
+
+Other notes:
+
+- `prepareModel` refuses to start the download when the device lacks the space
+  for it, rather than spending the user's data filling a disk that was never
+  going to hold the file.
+- Output passes two guards before it reaches a caption: a verbatim-echo check
+  (the classic small-LLM failure) and a repetition-loop check. A guard trip
+  surfaces as `SublyError.TranslationFailed`, not as silent nonsense.
+- Decoding is greedy (`topK = 1`), so the translator is reproducible — which
+  is what makes it usable inside the accuracy benchmark.
+- Gemma builds are deliberately not in the catalog. They are stronger, but the
+  Gemma Terms of Use are not an OSI licence and restrict downstream use, which
+  is the wrong default for an SDK others redistribute.
 
 ---
 
