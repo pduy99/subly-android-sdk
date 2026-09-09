@@ -36,6 +36,7 @@ import kotlinx.coroutines.flow.transformWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 
 /**
@@ -267,10 +268,20 @@ class SublySession internal constructor(
     private suspend fun warmUpTranslator() {
         val startNanos = System.nanoTime()
         try {
-            translationEngine.translate("Hello.")
+            // Bounded because "warm-up" is only worth doing if it is shorter
+            // than the thing it is warming. ML Kit's lazy init is ~500 ms; an
+            // LLM's first generation is tens of seconds and genuinely belongs
+            // here, behind the progress bar. Anything past the cap is not a
+            // warm-up, it is a hang, and prepare() should finish without it.
+            val warmed =
+                withTimeoutOrNull(WARM_UP_TIMEOUT_MS) { translationEngine.translate("Hello.") }
             BenchLog.metric(
-                "translate_warmup ms=${(System.nanoTime() - startNanos) / 1_000_000} ok=true"
+                "translate_warmup ms=${(System.nanoTime() - startNanos) / 1_000_000} " +
+                    "ok=${warmed != null}"
             )
+            if (warmed == null) {
+                Log.w(TAG, "Translator warm-up timed out after ${WARM_UP_TIMEOUT_MS}ms (non-fatal)")
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -461,6 +472,27 @@ class SublySession internal constructor(
 
         val tentativeSentence = "$pendingText $trimmed".trim()
 
+        // Some engines are finals-only (see SublyTranslator.translatesPartials
+        // — an on-device LLM is seconds per call, and this runs on the
+        // coroutine collecting ASR results). Show the hypothesis as source
+        // text: the same degradation a failed partial translation already
+        // gets. Returning here rather than short-circuiting the translate call
+        // also skips the prefix/tail throttle, which exists to ration
+        // translations — with none being made, rationing them would only
+        // leave the caption showing a stale, shorter hypothesis than the one
+        // the recogniser just produced.
+        if (!translationEngine.translatesPartials) {
+            BenchLog.metric(
+                "translate_skip kind=partial reason=engine src_len=${tentativeSentence.length}"
+            )
+            return Caption(
+                originalText = tentativeSentence,
+                translatedText = tentativeSentence,
+                isFinal = false,
+                mode = Caption.CaptureMode.AUDIO,
+            )
+        }
+
         // Split at the last sentence terminator: everything before it is
         // settled and won't change; only the tail is still in flux.
         val splitAt = lastTerminatorEnd(tentativeSentence)
@@ -625,6 +657,13 @@ class SublySession internal constructor(
          * a partial (mirrors [SentenceExtractor]'s set, including CJK marks).
          */
         val SENTENCE_TERMINATORS = setOf('.', '!', '?', '…', '。', '！', '？', '．')
+
+        /**
+         * Cap on the one-off translator warm-up during preparation. Sized for
+         * an on-device LLM's first generation on older hardware, not for
+         * ML Kit's ~500 ms lazy init.
+         */
+        const val WARM_UP_TIMEOUT_MS = 120_000L
 
         /** Pool remainder is flushed as a final this long after the last ASR final. */
         const val IDLE_FLUSH_MS = 3_000L

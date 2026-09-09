@@ -13,6 +13,24 @@ import kotlinx.coroutines.flow.Flow
 interface SublyTranslator {
 
     /**
+     * Whether partial (in-progress) captions should be routed through this
+     * engine.
+     *
+     * Partials arrive roughly every 200 ms and are re-translated as the
+     * clause grows, so the cost of one translation is paid many times per
+     * sentence. A per-pair NMT model absorbs that; an on-device LLM does not,
+     * and because `SublySession` translates on the coroutine that collects
+     * ASR results, a multi-second call there does not merely lag the caption
+     * — it applies backpressure all the way to audio capture.
+     *
+     * Engines that leave this `false` are asked to translate finals only.
+     * Partial captions still stream, carrying source text as their
+     * translation until the sentence completes — the same degradation the
+     * session already applies when a partial translation fails.
+     */
+    val translatesPartials: Boolean get() = true
+
+    /**
      * Translates [text] from the source to the target language configured via
      * the last successful [prepareModel].
      *
