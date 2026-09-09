@@ -32,9 +32,11 @@ dependencies {
     compileOnly(fileTree("libs") { include("*.aar") })
 
     api(projects.asr.api)
-    // api (not implementation): ModelDownloader appears in SherpaOnnxTranscriber's
-    // public constructor, so it must be visible to consumers of this module.
+    // api (not implementation): ModelDownloader and SpeechGate both appear in
+    // SherpaOnnxTranscriber's public constructor, so they must be visible to
+    // consumers of this module.
     api(projects.core.downloader)
+    api(projects.asr.vad)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)

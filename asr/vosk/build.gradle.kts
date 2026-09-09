@@ -34,9 +34,14 @@ android {
 
 dependencies {
     api(projects.asr.api)
-    // api (not implementation): ModelDownloader appears in VoskTranscriber's
-    // public constructor, so it must be visible to consumers of this module.
+    // api (not implementation): ModelDownloader and SpeechGate both appear in
+    // VoskTranscriber's public constructor, so they must be visible to
+    // consumers of this module.
     api(projects.core.downloader)
+    // The gate's sherpa-onnx runtime is compileOnly inside :asr:vad, so this
+    // adds no native dependency here — a vosk-only app links and runs without
+    // the AAR, and simply gets no gating.
+    api(projects.asr.vad)
 
     // Vosk (Kaldi) JNI + bundled native libs. Unlike the sherpa module this is
     // a normal Maven dependency, so the .so ships transitively — consumers need

@@ -3,6 +3,7 @@ package com.helios.subly.asr.vosk
 import android.content.Context
 import android.util.Log
 import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.asr.vad.SpeechGate
 import com.helios.subly.core.downloader.ModelDownloader
 import com.helios.subly.core.downloader.OkHttpModelDownloader
 import com.helios.subly.core.model.AsrResult
@@ -34,6 +35,7 @@ class VoskTranscriber internal constructor(
     private val context: Context,
     private val backend: VoskBackend,
     private val modelLoaderFactory: VoskModelLoaderFactory,
+    private val speechGate: SpeechGate?,
 ) : SublyAsr {
 
     /**
@@ -41,15 +43,27 @@ class VoskTranscriber internal constructor(
      *   prepare. Defaults to a plain [OkHttpModelDownloader]; supply your own
      *   (e.g. an OkHttp client with auth headers, certificate pinning, or a
      *   private mirror) to control how models are fetched.
+     * @param speechGate Silero gate that replaces non-speech audio with
+     *   silence before it reaches the recogniser, so music and room noise
+     *   stop being decoded into confident nonsense. Pass `null` to feed the
+     *   recogniser raw audio.
+     *
+     *   The gate runs on the sherpa-onnx runtime, which this module does not
+     *   otherwise need. An app that depends on `:asr:vosk` alone and ships no
+     *   sherpa AAR still builds and runs — the gate finds no runtime and
+     *   becomes a pass-through. Add the AAR to the app's runtime classpath
+     *   (see the README) to get the gate.
      */
     @JvmOverloads
     constructor(
         context: Context,
         modelDownloader: ModelDownloader = OkHttpModelDownloader(),
+        speechGate: SpeechGate? = SpeechGate(context, modelDownloader),
     ) : this(
         context = context,
         backend = VoskBackend.Jni,
         modelLoaderFactory = VoskModelLoaderFactory.of(modelDownloader),
+        speechGate = speechGate,
     )
 
     /** Lazily-initialized model/recognizer pair. Cleared on [release]. */
@@ -79,7 +93,15 @@ class VoskTranscriber internal constructor(
 
         return frames
             .transform { frame ->
-                val pcm = toMono16kShorts(frame)
+                val mono = toMono16kShorts(frame)
+                if (mono.isEmpty()) return@transform
+                // Muted, not dropped: Kaldi's endpointing decides where an
+                // utterance ends by counting trailing silence, so cutting the
+                // audio out would stop finals ever being emitted. The gate
+                // also holds a short lookahead back, so it returns less than
+                // it was given until its delay line fills — an empty return is
+                // normal, not a silent frame.
+                val pcm = speechGate?.process(mono) ?: mono
                 if (pcm.isEmpty()) return@transform
 
                 val endpoint = synchronized(nativeLock) {
@@ -163,9 +185,9 @@ class VoskTranscriber internal constructor(
 
         val loader = modelLoaderFactory.create(context)
 
-        // Provision (download + unpack): 0% -> 90%.
+        // Provision (download + unpack): 0% -> 85%.
         loader.provisionWithProgress(model)
-            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.9f)) }
+            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.85f)) }
             .collect {}
 
         // A finished-but-not-ready provision means no source was available or
@@ -183,6 +205,11 @@ class VoskTranscriber internal constructor(
             return@flow
         }
 
+        // Speech gate (~0.6 MB checkpoint): 85% -> 95%. Never fails the
+        // session — a gate that could not be built runs as a pass-through.
+        speechGate?.prepare()
+            ?.onEach { p -> emit(ModelPrepState.Preparing(0.85f + p * 0.10f)) }
+            ?.collect {}
         emit(ModelPrepState.Preparing(0.95f))
 
         val created = backend.init(loader.modelDir(model).absolutePath, VOSK_SAMPLE_RATE_HZ)
@@ -206,6 +233,7 @@ class VoskTranscriber internal constructor(
     override fun release() {
         synchronized(nativeLock) {
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+            speechGate?.release()
         }
     }
 
