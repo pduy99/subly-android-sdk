@@ -19,6 +19,7 @@ fun renderReport(
     appendLine("|---|---|")
     appendLine("| Device | ${meta.deviceModel} (API ${meta.deviceSdk}) |")
     appendLine("| SDK commit | `${meta.sdkGitSha}` |")
+    appendLine("| Translator | ${meta.translator} |")
     appendLine("| Judge model | ${meta.judgeModel} |")
     appendLine("| Prompt version | ${meta.promptVersion} |")
     if (judged.isNotEmpty()) {
@@ -90,6 +91,7 @@ fun renderScoresJson(meta: RunMetadata, judged: List<JudgedEntry>): String {
         "runId" to meta.runId,
         "device" to mapOf("model" to meta.deviceModel, "sdk" to meta.deviceSdk),
         "sdkGitSha" to meta.sdkGitSha,
+        "translator" to meta.translator,
         "judgeModel" to meta.judgeModel,
         "promptVersion" to meta.promptVersion,
         "entries" to judged.map { (input, s) ->

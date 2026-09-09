@@ -44,6 +44,8 @@ data class RunMetadata(
     val deviceModel: String,
     val deviceSdk: Int,
     val sdkGitSha: String,
+    /** Which translator produced the run. Older results.json files omit it. */
+    val translator: String,
     val judgeModel: String,
     val promptVersion: String,
 )
@@ -57,6 +59,11 @@ data class DeviceResults(
     val runId: String,
     val device: Device,
     val sdkGitSha: String,
+    /**
+     * Which translator the device stage used. Null in results.json files
+     * written before the field existed, which were all ML Kit.
+     */
+    val translator: String? = null,
     val entries: List<Entry>,
 ) {
     data class Device(val model: String, val sdk: Int)

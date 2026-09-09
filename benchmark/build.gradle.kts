@@ -52,6 +52,7 @@ dependencies {
     androidTestImplementation(projects.asr.whisper)
     androidTestImplementation(projects.asr.vosk)
     androidTestImplementation(projects.translator.mlkit)
+    androidTestImplementation(projects.translator.litertlm)
 
     androidTestImplementation(libs.kotlinx.coroutines.core)
     androidTestImplementation(libs.kotlinx.coroutines.android)

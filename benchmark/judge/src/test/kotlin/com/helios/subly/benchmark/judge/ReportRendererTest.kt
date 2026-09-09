@@ -32,6 +32,7 @@ class ReportRendererTest {
         deviceModel = "SM-G973F",
         deviceSdk = 31,
         sdkGitSha = "08d912e",
+        translator = "mlkit",
         judgeModel = "claude-sonnet-5",
         promptVersion = PROMPT_VERSION,
     )
