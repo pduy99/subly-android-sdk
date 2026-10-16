@@ -39,8 +39,14 @@ internal enum class LiteRtLmModel(
      */
     QWEN2_5_1_5B_INSTRUCT_Q8(
         fileName = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
+        // Pinned to a revision, not `main`: approxSizeBytes is checked
+        // against what lands on disk, so a re-upload on `main` would make
+        // every completed download look partial. 19edb84 is the revision the
+        // benchmark measured; `main` has since moved to metadata written for
+        // litert-lm 0.18.0, newer than the runtime this module ships.
         downloadUrl =
-            "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/" +
+            "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/" +
+                "19edb84c69a0212f29a6ef17ba0d6f278b6a1614/" +
                 "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
         approxSizeBytes = 1_597_931_520L,
         // Well under the 4096 the checkpoint was exported with, and far above

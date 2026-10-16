@@ -12,6 +12,7 @@ android {
 
     defaultConfig {
         minSdk = libs.versions.minSdk.get().toInt()
+        consumerProguardFiles("consumer-rules.pro")
 
         // arm64-v8a only, to match the rest of the SDK. litertlm-android also
         // ships x86_64, which no SDK target device uses.

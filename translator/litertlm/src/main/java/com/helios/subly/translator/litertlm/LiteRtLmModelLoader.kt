@@ -56,6 +56,15 @@ internal open class LiteRtLmModelLoader(
             emit(1f)
             return@flow
         }
+        // A file that exists but failed isReady (short, or from another
+        // revision) must go: the downloader treats any non-empty destination
+        // as already downloaded, so leaving it would fail every retry
+        // instantly without touching the network.
+        val file = modelFile(model)
+        if (file.exists()) {
+            Log.w(TAG, "Discarding ${model.fileName}: ${file.length()} bytes, expected ${model.approxSizeBytes}")
+            file.delete()
+        }
         Log.i(TAG, "Downloading ${model.fileName} (${model.approxSizeBytes / MB} MB)")
         downloader.downloadModel(model.downloadUrl, modelFile(model)).collect { emit(it) }
     }
