@@ -38,6 +38,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * A stateful captioning session for one language pair.
@@ -274,7 +275,7 @@ class SublySession internal constructor(
             // here, behind the progress bar. Anything past the cap is not a
             // warm-up, it is a hang, and prepare() should finish without it.
             val warmed =
-                withTimeoutOrNull(WARM_UP_TIMEOUT_MS) { translationEngine.translate("Hello.") }
+                withTimeoutOrNull(WARM_UP_TIMEOUT_MS.milliseconds) { translationEngine.translate("Hello.") }
             BenchLog.metric(
                 "translate_warmup ms=${(System.nanoTime() - startNanos) / 1_000_000} " +
                     "ok=${warmed != null}"
