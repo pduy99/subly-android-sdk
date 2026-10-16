@@ -3,6 +3,10 @@ package com.helios.subly.asr.vosk
 import android.content.Context
 import android.util.Log
 import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.core.model.AccelerationAware
+import com.helios.subly.core.model.AccelerationReport
+import com.helios.subly.core.model.BackendAttempt
+import com.helios.subly.core.model.DelegateType
 import com.helios.subly.asr.vad.SpeechGate
 import com.helios.subly.core.downloader.ModelDownloader
 import com.helios.subly.core.downloader.OkHttpModelDownloader
@@ -36,7 +40,13 @@ class VoskTranscriber internal constructor(
     private val backend: VoskBackend,
     private val modelLoaderFactory: VoskModelLoaderFactory,
     private val speechGate: SpeechGate?,
-) : SublyAsr {
+) : SublyAsr, AccelerationAware {
+
+    /** Kaldi/Vosk has no GPU or NPU path on Android: always CPU. */
+    @Volatile
+    override var accelerationReport: AccelerationReport? = null
+        private set
+
 
     /**
      * @param modelDownloader downloader used to fetch model zips on first
@@ -212,7 +222,20 @@ class VoskTranscriber internal constructor(
             ?.collect {}
         emit(ModelPrepState.Preparing(0.95f))
 
+        val initStart = System.nanoTime()
         val created = backend.init(loader.modelDir(model).absolutePath, VOSK_SAMPLE_RATE_HZ)
+        accelerationReport = AccelerationReport(
+            component = "asr:vosk:${model.dirName}",
+            active = DelegateType.CPU,
+            attempts = listOf(
+                BackendAttempt(
+                    DelegateType.CPU,
+                    succeeded = created != null,
+                    initMs = (System.nanoTime() - initStart) / 1_000_000,
+                    failure = if (created == null) "Vosk native init failed" else null,
+                )
+            ),
+        )
         if (created == null) {
             emit(
                 ModelPrepState.Error(

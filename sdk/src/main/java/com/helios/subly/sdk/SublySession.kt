@@ -38,6 +38,13 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
+import com.helios.subly.core.model.AccelerationAware
+import com.helios.subly.core.model.AccelerationReport
+import com.helios.subly.sdk.streaming.StageMetric
+import com.helios.subly.sdk.streaming.StreamingTranslationStage
+import com.helios.subly.sdk.streaming.TranslationState
+import com.helios.subly.sdk.streaming.WaitKPolicy
+import com.helios.subly.translator.api.IncrementalTranslator
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
@@ -96,6 +103,37 @@ class SublySession internal constructor(
 
     private var prepJob: Job? = null
     private var pipelineJob: Job? = null
+
+    private val _translationState = MutableStateFlow<TranslationState>(TranslationState.Idle)
+
+    /**
+     * Live translation of the sentence being spoken, for engines translated
+     * incrementally (see [IncrementalTranslator]). Unlike [captions] it is a
+     * state, not an event stream: collectors see the latest value only, and
+     * it stays [TranslationState.Idle] for engines that translate finals in
+     * one call.
+     */
+    val translationState: StateFlow<TranslationState> = _translationState.asStateFlow()
+
+    private val _stageMetrics = MutableSharedFlow<StageMetric>(
+        extraBufferCapacity = 256,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
+     * Timings from the incremental translation stage, as they happen: time to
+     * first token, per-piece latency, and ASR-final-to-translation latency.
+     * Hot and lossy under pressure (oldest dropped): for diagnostics and
+     * benchmarks, not for logic.
+     */
+    val stageMetrics: SharedFlow<StageMetric> = _stageMetrics.asSharedFlow()
+
+    /**
+     * Compute delegates the engines ended up on, for engines that report one.
+     * Empty until preparation has finished.
+     */
+    fun accelerationReports(): List<AccelerationReport> =
+        listOf(asrEngine, translationEngine).mapNotNull { (it as? AccelerationAware)?.accelerationReport }
 
     /**
      * Starts (or retries) model preparation. Idempotent: no-ops while
@@ -312,9 +350,48 @@ class SublySession internal constructor(
         val extractorMutex = Mutex()
         resetPartialThrottle()
         lastFinalOriginal = ""
+        _translationState.value = TranslationState.Idle
 
         channelFlow {
             var flushJob: Job? = null
+
+            // LLM-class translators are too slow to translate inline, on the
+            // coroutine collecting ASR results: every call back-pressures the
+            // recogniser and audio capture. They get a stage of their own that
+            // translates committed clauses as they settle and never blocks
+            // this collector.
+            val stage = incrementalTranslator()?.let { translator ->
+                StreamingTranslationStage(
+                    translator = translator,
+                    policy = WaitKPolicy.forLanguage(config.source),
+                    onState = { state ->
+                        _translationState.value = state
+                        when (state) {
+                            is TranslationState.Partial -> send(
+                                Caption(state.source, state.text, isFinal = false, mode = Caption.CaptureMode.AUDIO)
+                            )
+                            is TranslationState.Finalized -> send(
+                                Caption(state.source, state.text, isFinal = true, mode = Caption.CaptureMode.AUDIO)
+                            )
+                            is TranslationState.Failed -> throw SublyError.TranslationFailed(state.error)
+                            TranslationState.Idle -> Unit
+                        }
+                    },
+                    onMetric = ::logStageMetric,
+                )
+            }
+            val stageWorker = stage?.let { launch { it.run() } }
+
+            // Finals go through the stage when there is one, so they reuse the
+            // clauses it already translated; otherwise they are translated here.
+            suspend fun emitFinal(sentence: String, kind: String) {
+                if (stage != null) {
+                    BenchLog.transcript("final_source kind=$kind src=\"$sentence\"")
+                    stage.onFinal(sentence)
+                } else {
+                    send(buildFinalCaption(sentence, kind))
+                }
+            }
 
             asrEngine.transcribe(frames)
                 .collect { asrResult ->
@@ -327,9 +404,24 @@ class SublySession internal constructor(
                             // aren't split.
                             flushJob?.cancel()
                             val pending = extractorMutex.withLock { extractor.pending() }
-                            processPartialResult(
-                                pending, cjkSpacing.collapse(asrResult.text),
-                            )?.let { send(it) }
+                            if (stage != null) {
+                                val hypothesis = "$pending ${cjkSpacing.collapse(asrResult.text)}".trim()
+                                if (hypothesis.isNotEmpty()) {
+                                    stage.onPartial(hypothesis)
+                                    send(
+                                        Caption(
+                                            originalText = hypothesis,
+                                            translatedText = stage.translationForCurrentSentence(),
+                                            isFinal = false,
+                                            mode = Caption.CaptureMode.AUDIO,
+                                        )
+                                    )
+                                }
+                            } else {
+                                processPartialResult(
+                                    pending, cjkSpacing.collapse(asrResult.text),
+                                )?.let { send(it) }
+                            }
                         }
 
                         is AsrResult.Final -> {
@@ -364,7 +456,7 @@ class SublySession internal constructor(
                             }
                             for (sentence in sentences) {
                                 if (isDuplicateFinal(sentence)) continue
-                                send(buildFinalCaption(sentence, kind = "final"))
+                                emitFinal(sentence, kind = "final")
                             }
 
                             // Idle flush: if no further ASR final arrives to
@@ -397,7 +489,7 @@ class SublySession internal constructor(
                                         // sentence, so it does end here —
                                         // terminate it rather than shipping a
                                         // caption that trails off unpunctuated.
-                                        send(buildFinalCaption(terminate(remainder), kind = "flush"))
+                                        emitFinal(terminate(remainder), kind = "flush")
                                     }
                                 }
                             }
@@ -417,8 +509,13 @@ class SublySession internal constructor(
             val tail = extractorMutex.withLock { extractor.drain() }
             if (tail.isNotEmpty() && !isDuplicateFinal(tail)) {
                 BenchLog.metric("sentence_flush_eos len=${tail.length}")
-                send(buildFinalCaption(terminate(tail), kind = "flush"))
+                emitFinal(terminate(tail), kind = "flush")
             }
+
+            // Let the stage translate everything already heard before the
+            // stream completes; dropping it would lose the last captions.
+            stage?.finish()
+            stageWorker?.join()
         }
             .catch { e ->
                 if (e is CancellationException) throw e
@@ -426,6 +523,20 @@ class SublySession internal constructor(
                 _state.value = EngineState.Error(error)
             }
             .collect { caption -> _captions.emit(caption) }
+    }
+
+    private fun incrementalTranslator(): IncrementalTranslator? =
+        (translationEngine as? IncrementalTranslator)?.takeIf { !translationEngine.translatesPartials }
+
+    private fun logStageMetric(metric: StageMetric) {
+        val name = when (metric.kind) {
+            StageMetric.Kind.TTFT -> "translate_ttft"
+            StageMetric.Kind.PIECE -> "translate_piece"
+            StageMetric.Kind.FINAL -> "translate_final_latency"
+            StageMetric.Kind.FORCED_COMMIT -> "waitk_forced_commit"
+        }
+        BenchLog.metric("$name ms=${metric.ms} src_len=${metric.sourceChars}")
+        _stageMetrics.tryEmit(metric)
     }
 
     /**

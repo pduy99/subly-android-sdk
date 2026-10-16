@@ -5,22 +5,35 @@ import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.helios.subly.core.downloader.ModelDownloader
 import com.helios.subly.core.downloader.OkHttpModelDownloader
+import com.helios.subly.core.model.AccelerationAware
+import com.helios.subly.core.model.AccelerationReport
+import com.helios.subly.core.model.BackendAttempt
+import com.helios.subly.core.model.DelegateType
 import com.helios.subly.core.model.LanguageConfig
 import com.helios.subly.core.model.ModelPrepState
+import com.helios.subly.translator.api.IncrementalTranslator
 import com.helios.subly.translator.api.SublyTranslator
-import kotlinx.coroutines.CancellationException
+import com.helios.subly.translator.api.TranslationSegment
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
 import kotlin.math.min
 
 /**
@@ -34,100 +47,210 @@ import kotlin.math.min
  * instruction-tuned LLM handles all three — for a ~1.6 GB download and
  * seconds, not milliseconds, per caption.
  *
- * That latency is the whole design constraint here, and it is why this
- * translator declares [translatesPartials] `false`. Partials arrive every
- * ~200 ms and are re-translated as they grow; routing those through a
- * multi-second generation does not degrade gracefully, it stalls the audio
- * pipeline, because `SublySession` translates on the same coroutine that
- * collects ASR results. Finals go through the LLM; partials show source text
- * until the sentence completes.
+ * That latency is why [translatesPartials] stays `false`: re-translating a
+ * growing partial every ~200 ms through a multi-second generation cannot keep
+ * up. Partials are instead translated incrementally through
+ * [IncrementalTranslator]: the session commits a sentence clause by clause
+ * (see `WaitKBuffer`), and each clause is one turn in a conversation that
+ * lives for the sentence, so the earlier clauses are context already in the KV
+ * cache rather than text prefilled again.
+ *
+ * ## Compute delegates
+ *
+ * [prepareModel] tries the delegates in [preferredDelegates] order and keeps
+ * the first that both initialises and completes a tiny test generation; the
+ * outcome is in [accelerationReport]. Two failure shapes are handled:
+ *  - the delegate throws (no GPU support for the model, missing NPU
+ *    libraries): recorded, next delegate tried;
+ *  - the delegate takes the process down in native code: a marker file
+ *    written before the attempt survives the crash, and the next launch skips
+ *    that delegate instead of crashing again. It is retried after
+ *    [CRASH_MARKER_TTL_MS], in case an OS or driver update fixed it.
  *
  * ## Threading
  *
- * `sendMessage` is a blocking native call, so [translate] moves to
- * [Dispatchers.Default]. Generation and [release] are serialised on one lock:
- * closing the engine while a generation is in flight frees memory the native
- * side is still reading. The consequence is that [release] blocks until any
- * in-flight caption finishes — the same caveat the SDK already documents for
- * `SublySession.close()`, just measured in seconds rather than milliseconds.
+ * LiteRT-LM generates on one native engine, one request at a time. Every
+ * generation and [release] take [inferenceLock], so the engine is never freed
+ * mid-inference; [release] cancels the running generation first, so it waits
+ * for at most the current token rather than a whole caption.
  */
 class LiteRtLmTranslator internal constructor(
     private val context: Context,
     private val model: LiteRtLmModel,
     private val loader: LiteRtLmModelLoader,
     private val threadCount: Int,
-) : SublyTranslator {
+    private val preferredDelegates: List<DelegateType>,
+) : SublyTranslator, IncrementalTranslator, AccelerationAware {
 
     /**
      * @param modelDownloader downloader used to fetch the checkpoint on first
      *   prepare. Defaults to a plain [OkHttpModelDownloader]; supply your own
      *   to control how the ~1.6 GB transfer is made (metered-network
      *   policies, a private mirror, resume).
+     * @param preferredDelegates delegates to try, in order. CPU is always
+     *   appended as the last resort if missing. NPU is only useful with a
+     *   checkpoint compiled for the device's NPU; the default model is not,
+     *   so the default skips it.
      */
     @JvmOverloads
     constructor(
         context: Context,
         modelDownloader: ModelDownloader = OkHttpModelDownloader(),
+        preferredDelegates: List<DelegateType> = DEFAULT_DELEGATES,
     ) : this(
         context = context,
         model = LiteRtLmModel.Default,
         loader = LiteRtLmModelLoader(context, modelDownloader),
         threadCount = defaultThreadCount(),
+        preferredDelegates = preferredDelegates,
     )
 
-    /** See the class docs: an LLM is a finals-only translator. */
     override val translatesPartials: Boolean = false
 
+    @Volatile
+    override var accelerationReport: AccelerationReport? = null
+        private set
+
+    @Volatile
     private var engine: Engine? = null
 
     /** Rebuilt per language pair; the engine itself is pair-agnostic. */
+    @Volatile
     private var conversationConfig: ConversationConfig? = null
+
+    @Volatile
+    private var incrementalConfig: ConversationConfig? = null
     private var sourceTag: String = ""
     private var targetTag: String = ""
 
-    /**
-     * Serialises generation against [release] so the engine is never freed
-     * mid-inference, and serialises concurrent [translate] calls — one native
-     * engine, one generation at a time.
-     */
-    private val inferenceLock = Any()
+    private val inferenceLock = Mutex()
+
+    /** The conversation generating right now, so [release] can cancel it. */
+    @Volatile
+    private var activeConversation: Conversation? = null
 
     override suspend fun translate(text: String): String {
         val source = text.trim()
         check(engine != null) { "Translator not prepared. Call prepareModel first." }
         if (source.isEmpty()) return ""
 
-        return withContext(Dispatchers.Default) {
-            synchronized(inferenceLock) {
+        return inferenceLock.withLock {
+            withContext(Dispatchers.Default) {
                 val activeEngine = engine
                     ?: throw IllegalStateException("Translator was released mid-translation.")
-                val config = requireNotNull(conversationConfig)
 
                 // A fresh conversation per caption. Reusing one would let the
                 // previous captions accumulate as history, which for a
                 // translation task is pure drift: the model starts answering
                 // about the conversation instead of translating the sentence.
-                val conversation = activeEngine.createConversation(config)
+                val conversation = activeEngine.createConversation(requireNotNull(conversationConfig))
+                activeConversation = conversation
                 val raw = try {
                     textOf(conversation.sendMessage(source))
                 } finally {
+                    activeConversation = null
                     conversation.close()
                 }
-
-                val translated = TranslationPrompt.clean(raw)
-                // NOTE: never log `source` or `translated` — end-user speech.
-                when {
-                    TranslationGuards.isSourceEcho(translated, source, sourceTag, targetTag) ->
-                        error("Model echoed the source instead of translating it.")
-
-                    TranslationGuards.isDegenerate(translated) ->
-                        error("Model produced degenerate output (${translated.length} chars).")
-
-                    else -> translated
-                }
+                checkedTranslation(TranslationPrompt.clean(raw), source, allowBlank = false)
             }
         }
     }
+
+    override fun openSegment(): TranslationSegment {
+        check(engine != null) { "Translator not prepared. Call prepareModel first." }
+        return Segment()
+    }
+
+    /**
+     * One sentence as one conversation. Opened lazily on the first append so
+     * an abandoned, never-used segment costs nothing.
+     */
+    private inner class Segment : TranslationSegment {
+        private var conversation: Conversation? = null
+        private val sources = ArrayList<String>()
+        private val translations = ArrayList<String>()
+
+        override val source: String get() = sources.joinToString(" ")
+        override val translation: String get() = translations.filter { it.isNotEmpty() }.joinToString(" ")
+
+        override fun append(sourceDelta: String): Flow<String> = flow {
+            val piece = sourceDelta.trim()
+            if (piece.isEmpty()) return@flow
+
+            inferenceLock.withLock {
+                val activeEngine = engine
+                    ?: throw IllegalStateException("Translator was released mid-translation.")
+                val conv = conversation
+                    ?: activeEngine.createConversation(requireNotNull(incrementalConfig))
+                        .also { conversation = it }
+
+                var raw = ""
+                activeConversation = conv
+                try {
+                    streamTokens(conv, piece).collect { chunk ->
+                        raw = accumulate(raw, chunk)
+                        val shown = TranslationPrompt.clean(raw)
+                        if (shown.isNotEmpty()) emit(shown)
+                    }
+                } finally {
+                    activeConversation = null
+                }
+
+                val translated = checkedTranslation(TranslationPrompt.clean(raw), piece, allowBlank = true)
+                sources.add(piece)
+                translations.add(translated)
+                emit(translated)
+            }
+        }.flowOn(Dispatchers.Default)
+
+        override fun close() {
+            val conv = conversation ?: return
+            conversation = null
+            runCatching { conv.close() }
+        }
+    }
+
+    /**
+     * Bridges LiteRT-LM's callback streaming into a flow of text chunks.
+     * Cancelling the collector cancels the native generation.
+     */
+    private fun streamTokens(conversation: Conversation, text: String): Flow<String> = callbackFlow {
+        conversation.sendMessageAsync(
+            text,
+            object : MessageCallback {
+                override fun onMessage(message: Message) {
+                    trySend(textOf(message))
+                }
+
+                override fun onDone() {
+                    close()
+                }
+
+                override fun onError(throwable: Throwable) {
+                    close(throwable)
+                }
+            },
+        )
+        awaitClose { runCatching { conversation.cancelProcess() } }
+    }
+
+    /**
+     * Streaming callbacks carry either the newest chunk or the whole reply so
+     * far, depending on runtime version; accept both.
+     */
+    private fun accumulate(soFar: String, chunk: String): String =
+        if (soFar.isNotEmpty() && chunk.startsWith(soFar)) chunk else soFar + chunk
+
+    // NOTE: never log `source` or `translated` — end-user speech.
+    private fun checkedTranslation(translated: String, source: String, allowBlank: Boolean): String =
+        when {
+            translated.isBlank() && allowBlank -> ""
+            TranslationGuards.isSourceEcho(translated, source, sourceTag, targetTag) ->
+                error("Model echoed the source instead of translating it.")
+            TranslationGuards.isDegenerate(translated) ->
+                error("Model produced degenerate output (${translated.length} chars).")
+            else -> translated
+        }
 
     override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
         emit(ModelPrepState.Checking)
@@ -151,7 +274,12 @@ class LiteRtLmTranslator internal constructor(
         // different pair against the same warm engine.
         sourceTag = config.source
         targetTag = config.target
-        conversationConfig = buildConversationConfig(sourceTag, targetTag)
+        conversationConfig = buildConversationConfig(
+            TranslationPrompt.systemInstruction(sourceTag, targetTag), MAX_OUTPUT_TOKENS,
+        )
+        incrementalConfig = buildConversationConfig(
+            TranslationPrompt.incrementalInstruction(sourceTag, targetTag), MAX_OUTPUT_TOKENS,
+        )
 
         if (engine != null) {
             emit(ModelPrepState.Ready)
@@ -186,41 +314,131 @@ class LiteRtLmTranslator internal constructor(
 
         emit(ModelPrepState.Preparing(0.92f))
 
-        val created = runCatching {
-            Engine(
-                EngineConfig(
-                    modelPath = loader.modelFile(model).absolutePath,
-                    backend = Backend.CPU(threadCount = threadCount),
-                    maxNumTokens = model.maxNumTokens,
-                    cacheDir = context.cacheDir.absolutePath,
+        val attempts = ArrayList<BackendAttempt>()
+        var created: Engine? = null
+        var lastError: Throwable? = null
+        for (delegate in delegateOrder()) {
+            val (attempt, result) = tryDelegate(delegate)
+            attempts.add(attempt)
+            if (result.isSuccess) {
+                created = result.getOrThrow()
+                break
+            }
+            lastError = result.exceptionOrNull()
+        }
+
+        if (created == null) {
+            // Every delegate, CPU included, failed. Engine init is where an
+            // out-of-memory device fails, and it throws rather than returning
+            // null; per the ModelPrepState contract this surfaces as Error.
+            emit(
+                ModelPrepState.Error(
+                    IllegalStateException(
+                        "LiteRT-LM engine init failed on every delegate: " +
+                            attempts.joinToString { "${it.delegate}=${it.failure}" },
+                        lastError,
+                    )
                 )
-            ).apply { initialize() }
-        }.getOrElse { error ->
-            // Engine init is where an out-of-memory device fails, and it
-            // throws rather than returning null. Per the ModelPrepState
-            // contract this must surface as Error, not as an exception
-            // escaping the flow.
-            emit(ModelPrepState.Error(IllegalStateException("LiteRT-LM engine init failed", error)))
+            )
             return@flow
         }
 
-        synchronized(inferenceLock) { engine = created }
-        Log.i(TAG, "LiteRT-LM engine ready (${model.fileName}, $threadCount threads)")
+        val report = AccelerationReport(
+            component = "translator:${model.name}",
+            active = attempts.last().delegate,
+            attempts = attempts,
+        )
+        inferenceLock.withLock { engine = created }
+        accelerationReport = report
+        Log.i(
+            TAG,
+            "LiteRT-LM engine ready (${model.fileName}) on ${report.active}; attempts: " +
+                attempts.joinToString { "${it.delegate} ${if (it.succeeded) "ok" else it.failure} ${it.initMs}ms" },
+        )
         emit(ModelPrepState.Ready)
     }.flowOn(Dispatchers.IO)
 
+    private fun delegateOrder(): List<DelegateType> =
+        (preferredDelegates + DelegateType.CPU).distinct()
+
+    /**
+     * Initialises an engine on [delegate] and proves it with a tiny
+     * generation, under a crash marker.
+     */
+    private fun tryDelegate(delegate: DelegateType): Pair<BackendAttempt, Result<Engine>> {
+        val marker = crashMarker(delegate)
+        if (delegate != DelegateType.CPU && marker.exists()) {
+            val age = System.currentTimeMillis() - marker.lastModified()
+            if (age < CRASH_MARKER_TTL_MS) {
+                val note = "skipped: the process died during init on this delegate ${age / 60_000} min ago"
+                return BackendAttempt(delegate, succeeded = false, initMs = 0, failure = note) to
+                    Result.failure(IllegalStateException(note))
+            }
+        }
+
+        val start = System.nanoTime()
+        marker.parentFile?.mkdirs()
+        runCatching { marker.writeText(delegate.name) }
+        val result = runCatching {
+            val candidate = Engine(
+                EngineConfig(
+                    modelPath = loader.modelFile(model).absolutePath,
+                    backend = backendFor(delegate),
+                    maxNumTokens = model.maxNumTokens,
+                    cacheDir = context.cacheDir.absolutePath,
+                )
+            )
+            try {
+                candidate.initialize()
+                // Init alone does not prove a delegate: a GPU path can
+                // initialise and then fail on the first kernel. One short
+                // generation exercises prefill and decode end to end.
+                candidate.createConversation(
+                    buildConversationConfig(TranslationPrompt.systemInstruction("en", "en"), PROBE_OUTPUT_TOKENS)
+                ).use { it.sendMessage("Hi") }
+                candidate
+            } catch (t: Throwable) {
+                runCatching { candidate.close() }
+                throw t
+            }
+        }
+        marker.delete()
+        val ms = (System.nanoTime() - start) / 1_000_000
+        val attempt = BackendAttempt(
+            delegate = delegate,
+            succeeded = result.isSuccess,
+            initMs = ms,
+            failure = result.exceptionOrNull()?.let { "${it.javaClass.simpleName}: ${it.message}" },
+        )
+        if (result.isFailure) Log.w(TAG, "LiteRT-LM init on $delegate failed after ${ms}ms", result.exceptionOrNull())
+        return attempt to result
+    }
+
+    private fun backendFor(delegate: DelegateType): Backend = when (delegate) {
+        DelegateType.CPU -> Backend.CPU(threadCount = threadCount)
+        DelegateType.GPU -> Backend.GPU()
+        DelegateType.NPU -> Backend.NPU(nativeLibraryDir = context.applicationInfo.nativeLibraryDir)
+    }
+
+    private fun crashMarker(delegate: DelegateType): File =
+        File(File(context.filesDir, CRASH_MARKER_DIR), "${model.name}.${delegate.name}.init")
+
     override fun release() {
-        synchronized(inferenceLock) {
-            runCatching { engine?.close() }
-            engine = null
-            conversationConfig = null
+        runCatching { activeConversation?.cancelProcess() }
+        runBlocking {
+            inferenceLock.withLock {
+                runCatching { engine?.close() }
+                engine = null
+                conversationConfig = null
+                incrementalConfig = null
+            }
         }
     }
 
     override fun supportedLanguages(): List<String> = model.supportedLanguages
 
-    private fun buildConversationConfig(source: String, target: String) = ConversationConfig(
-        systemInstruction = Contents.of(TranslationPrompt.systemInstruction(source, target)),
+    private fun buildConversationConfig(instruction: String, maxOutputTokens: Int) = ConversationConfig(
+        systemInstruction = Contents.of(instruction),
         // topK = 1 is greedy decoding, which makes temperature and topP
         // inert. Greedy on purpose: a translator inside an accuracy benchmark
         // has to be reproducible, and sampling buys variety that a subtitle
@@ -229,7 +447,7 @@ class LiteRtLmTranslator internal constructor(
         // The latency guard. A caption is one sentence, so a generation that
         // runs past this is a repetition loop, and on this hardware every
         // extra token is real wall-clock time on the audio pipeline.
-        maxOutputToken = MAX_OUTPUT_TOKENS,
+        maxOutputToken = maxOutputTokens,
     )
 
     /** Concatenates the text parts of a model reply, ignoring other content. */
@@ -244,6 +462,15 @@ class LiteRtLmTranslator internal constructor(
         /** Generous for one sentence in any target language, bounded for latency. */
         const val MAX_OUTPUT_TOKENS = 256
 
+        /** The delegate probe only needs to see decode run. */
+        const val PROBE_OUTPUT_TOKENS = 4
+
+        const val CRASH_MARKER_DIR = "litertlm/init-guard"
+
+        /** A delegate that crashed the process is retried after a day. */
+        const val CRASH_MARKER_TTL_MS = 24L * 60 * 60 * 1000
+
+        val DEFAULT_DELEGATES = listOf(DelegateType.GPU, DelegateType.CPU)
     }
 }
 

@@ -3,6 +3,10 @@ package com.helios.subly.asr.whisper
 import android.content.Context
 import android.util.Log
 import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.core.model.AccelerationAware
+import com.helios.subly.core.model.AccelerationReport
+import com.helios.subly.core.model.BackendAttempt
+import com.helios.subly.core.model.DelegateType
 import com.helios.subly.core.model.AsrResult
 import com.helios.subly.core.model.AudioFrame
 import com.helios.subly.core.model.LanguageConfig
@@ -50,7 +54,16 @@ class WhisperTranscriber(
      * "continue" them. Empty disables biasing.
      */
     private val glossary: String = "",
-) : SublyAsr {
+) : SublyAsr, AccelerationAware {
+
+    /**
+     * whisper.cpp is built CPU-only (NEON + fp16); `use_gpu` is off in the
+     * JNI layer. Reported so callers can see that rather than assume.
+     */
+    @Volatile
+    override var accelerationReport: AccelerationReport? = null
+        private set
+
 
     private val handleRef = AtomicLong(0L)
     private val targetLangRef = AtomicReference("")
@@ -110,9 +123,19 @@ class WhisperTranscriber(
         emit(ModelPrepState.Preparing(0.9f))
         val initStartNanos = System.nanoTime()
         val created = backend.init(modelPath, targetLangRef.get(), vadPath, glossary.trim())
-        BenchLog.metric(
-            "model_init ms=${(System.nanoTime() - initStartNanos) / 1_000_000} " +
-                    "model=$modelAsset ok=${created != 0L}"
+        val initMs = (System.nanoTime() - initStartNanos) / 1_000_000
+        BenchLog.metric("model_init ms=$initMs model=$modelAsset ok=${created != 0L}")
+        accelerationReport = AccelerationReport(
+            component = "asr:whisper:$modelAsset",
+            active = DelegateType.CPU,
+            attempts = listOf(
+                BackendAttempt(
+                    DelegateType.CPU,
+                    succeeded = created != 0L,
+                    initMs = initMs,
+                    failure = if (created == 0L) "whisper_init returned null" else null,
+                )
+            ),
         )
 
         if (created == 0L) {

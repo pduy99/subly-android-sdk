@@ -45,8 +45,14 @@ class FileAudioCapture(private val file: File) : ProjectionlessAudioCapture {
      */
     val finished: Deferred<Unit> get() = _finished
 
+    /**
+     * The whole clip as mono 16 kHz PCM, decoded at once with no pacing, for
+     * callers that feed audio themselves rather than play it.
+     */
+    fun decodeMono16k(): ShortArray = resampleLinear(decodeToMono(file), TARGET_SAMPLE_RATE_HZ)
+
     override fun frames(): Flow<AudioFrame> = flow {
-        val pcm = resampleLinear(decodeToMono(file), TARGET_SAMPLE_RATE_HZ)
+        val pcm = decodeMono16k()
         val startNanos = System.nanoTime()
         var emittedSamples = 0
 

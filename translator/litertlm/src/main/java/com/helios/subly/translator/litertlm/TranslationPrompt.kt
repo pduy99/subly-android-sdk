@@ -29,6 +29,26 @@ internal object TranslationPrompt {
     }
 
     /**
+     * System instruction for incremental translation of one sentence.
+     *
+     * The sentence arrives as consecutive user messages, one per committed
+     * clause. Each reply must translate only the newest piece, written to
+     * follow the earlier replies, so the replies joined in order are the
+     * sentence's translation. Earlier pieces stay in the conversation (and so
+     * in the KV cache): they are context for the new piece, not re-translated.
+     */
+    fun incrementalInstruction(sourceTag: String, targetTag: String): String {
+        val source = languageName(sourceTag)
+        val target = languageName(targetTag)
+        return "You are a live subtitle translation engine. The user sends one $source " +
+            "sentence in consecutive pieces. Translate each piece into $target as the " +
+            "continuation of your previous replies, so that your replies joined in order " +
+            "read as one fluent $target sentence. Reply with the translation of the newest " +
+            "piece only: never repeat earlier pieces, no explanation, no notes, no quotation " +
+            "marks, and no romanisation."
+    }
+
+    /**
      * English display name for a BCP-47 tag, e.g. `vi` -> `Vietnamese`.
      *
      * Uses the platform's own tables rather than a hand-written map, so
