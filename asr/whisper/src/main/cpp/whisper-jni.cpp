@@ -216,6 +216,34 @@ namespace {
 
 extern "C" {
 
+// ggml and whisper.cpp log to stderr, which Android discards. Route both to
+// logcat so backend selection and GPU failures are visible. Debug lines are
+// dropped: whisper emits them per decode.
+static void log_to_logcat(enum ggml_log_level level, const char * text, void *) {
+    int prio;
+    switch (level) {
+        case GGML_LOG_LEVEL_ERROR: prio = ANDROID_LOG_ERROR; break;
+        case GGML_LOG_LEVEL_WARN:  prio = ANDROID_LOG_WARN;  break;
+        case GGML_LOG_LEVEL_INFO:  prio = ANDROID_LOG_INFO;  break;
+        case GGML_LOG_LEVEL_CONT:  prio = ANDROID_LOG_INFO;  break;
+        default: return;
+    }
+    __android_log_write(prio, "ggml", text);
+}
+
+// GGML_ASSERT failures print their message to stderr before abort(); without
+// this the tombstone shows only "ggml_abort".
+static void abort_to_logcat(const char * message) {
+    __android_log_write(ANDROID_LOG_FATAL, "ggml", message);
+}
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *, void *) {
+    ggml_set_abort_callback(abort_to_logcat);
+    ggml_log_set(log_to_logcat, nullptr);
+    whisper_log_set(log_to_logcat, nullptr);
+    return JNI_VERSION_1_6;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_helios_subly_asr_whisper_WhisperNative_nativeIsAvailable(JNIEnv *, jobject) {
     return JNI_TRUE;
@@ -263,6 +291,11 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
     // delegate crash before (see WhisperTranscriber). With no GPU device
     // registered, whisper.cpp runs on the CPU regardless.
     cparams.use_gpu = use_gpu == JNI_TRUE;
+    // Flash attention off on the GPU: through ggml's OpenCL flash-attn
+    // kernels on Adreno 750 every window decoded to empty text (measured on
+    // FLEURS en_01: 0 of 8 windows transcribed), while the same model with
+    // regular attention transcribed correctly. The CPU path keeps it on.
+    if (cparams.use_gpu) cparams.flash_attn = false;
 
     whisper_context * ctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
     if (!ctx) {

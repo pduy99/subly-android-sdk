@@ -71,8 +71,9 @@ import java.util.concurrent.CopyOnWriteArrayList
  *   -Pandroid.testInstrumentationRunnerArguments.class=\
  * com.helios.subly.benchmark.latency.StreamingLatencyBenchmarkTest
  * ```
- * Optional runner arguments: `latencyAsr` (`vosk`, default, or `whisper`)
- * and `latencyClips` (comma-separated clip ids).
+ * Optional runner arguments: `latencyAsr` (`vosk`, default, or `whisper`),
+ * `latencyClips` (comma-separated clip ids) and `latencyWhisperGpu`
+ * (`false` keeps whisper on the CPU).
  */
 class StreamingLatencyBenchmarkTest {
 
@@ -214,6 +215,11 @@ class StreamingLatencyBenchmarkTest {
                     scope.cancel()
                 }
 
+                // Zero captions from a clip of read speech means the pipeline
+                // is broken (it is how a miscomputing GPU path first showed
+                // up), not that it was fast: fail rather than report nothing.
+                if (finalsAt.isEmpty()) return failed("no captions produced")
+
                 val finalLatencies = metrics.filter { it.kind == StageMetric.Kind.FINAL }.map { it.ms }
                 // Pair each published final with its ASR-final time (published
                 // time minus the stage's final latency), then look back to the
@@ -254,7 +260,8 @@ class StreamingLatencyBenchmarkTest {
     }
 
     private fun asrFactory(name: String): SublyAsr = when (name) {
-        "whisper" -> WhisperTranscriber(context)
+        // latencyWhisperGpu=false pins whisper to the CPU, for A/B runs.
+        "whisper" -> WhisperTranscriber(context, preferGpu = args.getString("latencyWhisperGpu") != "false")
         "vosk" -> VoskTranscriber(context)
         else -> error("unknown latencyAsr '$name' (vosk|whisper)")
     }
