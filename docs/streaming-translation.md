@@ -90,8 +90,22 @@ then fail on its first kernel.
 | Every delegate fails, CPU included | `ModelPrepState.Error`, session `EngineState.Error` | error message lists each delegate's failure |
 | NPU requested | Only useful with a checkpoint compiled for the device's NPU. The default Qwen2.5 checkpoint is not, so NPU is not in the default order | — |
 
-ASR: whisper.cpp is built CPU-only (NEON + fp16) and Vosk has no accelerator
-path; both report `DelegateType.CPU` honestly in their `AccelerationReport`.
+**Whisper** (`WhisperTranscriber.prepareModel`) tries the GPU through ggml's
+OpenCL backend, then the CPU:
+
+| What goes wrong | What happens | Visible as |
+|---|---|---|
+| No vendor `libOpenCL.so`, or the vendor does not expose it to apps | The shim's `dlopen` fails, every OpenCL call reports "no platform", ggml registers no OpenCL device | GPU attempt `failure = "no OpenCL GPU device …"`, CPU active, default `small-q5_1` model |
+| OpenCL present but the device is dropped as unsupported by ggml | Same as above | same |
+| GPU init or its warm-up inference fails | CPU init on the same (q8_0) file | GPU attempt failed, CPU active |
+| GPU path kills the process | Marker survives; next launch skips the GPU for 24 h | GPU attempt `failure = "skipped: …"` |
+| An op the OpenCL backend does not implement | ggml's scheduler runs that op on the CPU; correctness unaffected | not reported per op |
+
+Why q8_0 on the GPU: the OpenCL backend has Adreno-tuned q8_0 (and q4_0,
+f16) matmul kernels and none for q5_1, so the CPU default model on the GPU
+would leave its matmuls on the CPU.
+
+**Vosk** has no accelerator path and always reports `CPU`.
 
 ### 3.2 Worst-case latency
 
@@ -112,7 +126,7 @@ path; both report `DelegateType.CPU` honestly in their `AccelerationReport`.
 | LLM weights | 1,597,931,520 bytes, memory-mapped | file size; resident pages are file-backed and reclaimable, so they count in RSS but the kernel can drop them |
 | LLM KV cache | ≤ 112 MiB | 2 (K,V) × 28 layers × 2 KV heads × 128 head dim × 4 bytes (fp32 upper bound) × 2,048 tokens (`maxNumTokens`) |
 | Conversations alive | 1 | one segment per sentence; closed before the next opens |
-| Whisper small q5_1 | 190,085,487 bytes + compute buffers | model file; buffers measured below |
+| Whisper small q5_1 (CPU) / q8_0 (GPU) | 190,085,487 / 264,464,607 bytes + compute buffers | model files; buffers measured below |
 | Vosk small | 31–133 MB per language | `VoskModels` |
 | Stage queue | O(1) per sentence | merged appends (3.2) |
 
