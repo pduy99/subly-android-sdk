@@ -259,3 +259,44 @@ whisper small needs ~0.9 s on this GPU to decode its first 1.5 s window, and
 the 4B translator ~1.1 s to its first token, so the floor for "audio in →
 first translated token" is ~2 s before any queueing. The 1.5B translator
 would save ~0.6 s and translate wrongly (above).
+
+## Chinese (Mandarin) on an 8 GB phone
+
+Galaxy S10 (SM-G973F, Exynos 9820, Mali-G76, 7.6 GB, Android 12), 2026-10-17.
+Test clip: `benchmark/src/androidTest/assets/realworld/zh_dialogue_01.mp4`, 48 s of
+fast multi-speaker dialogue with names and slang; reference = its subtitles.
+
+### Recognition (`ChineseAsrProbeTest`, character error rate)
+
+| Recogniser | Dialogue clip | FLEURS zh 01 / 02 | Real-time factor |
+|---|---|---|---|
+| Vosk small-cn | 53.9% | 14.8% / 12.3% | 0.71 |
+| whisper small q5_1 (CPU) | 42.4% | 48.9% / 52.6% | 1.1–8.3 |
+| **sherpa streaming zipformer-zh (2025-06-30, int8)** | **14.5%** | 5.7% / 6.1% | 0.31 |
+| **SenseVoice (2025-09-09, int8) + VAD** | **12.7%** | 9.1% / 6.1% | 0.13 |
+| sherpa zipformer multi-zh-hans (2023-12-13) | 14.5% | 12.5% / 5.3% | 0.26 |
+| Paraformer-zh (2025-10-07) | 17.0% | 11.4% / 6.1% | 0.09 |
+
+The app now uses the zipformer for Streaming mode and SenseVoice for Batch mode
+when the source is Chinese. Neither punctuates, and a final from fast dialogue
+was several subtitle lines in one run, so `ChinesePunctuator` (CT-Transformer,
+int8, SHA-256-verified) restores 。，？ in finals and partials, and
+`CjkSentenceSplitter` cuts at clause punctuation (18 characters). **Measured in
+the shipping app** (system-audio capture of the clip played in the phone's video
+player): **14.5% character error**, with subtitle-sized lines.
+
+### Translation, Chinese → Vietnamese (`TranslatorModelProbeTest`, the clip's lines)
+
+| Translator | Time to first token | Outcome |
+|---|---|---|
+| ML Kit | 65–140 ms | about half the colloquial lines right ("Bạn cũng bán cái này, phải không?"); literal on others (等会儿 → "Chờ đợi bạn") |
+| ML Kit via English | same | identical output: it already pivots |
+| Qwen3-4B, GPU | ~10 s | best quality ("Anh là người bán này à?"), too slow for live captions here |
+| Qwen3-4B, CPU | — | killed for memory at 4.6 GB |
+| Qwen2.5-1.5B, GPU | 2.7–5.6 s | answers in Chinese (stripped by the leak guard to "。") |
+| Qwen3-1.7B, GPU (LiteRT-LM 0.18, not shipped) | 2.2–4.5 s | English, Thai, leaked reasoning |
+
+So on 8 GB phones the app translates with ML Kit (`LiteRtLmModel.canRunLargeModel`
+is false), and on 12 GB-class phones with Qwen3-4B. On this class of phone
+**recognition is good and translation is limited by ML Kit's quality on
+colloquial speech**; no measured on-device LLM is both live and correct here.

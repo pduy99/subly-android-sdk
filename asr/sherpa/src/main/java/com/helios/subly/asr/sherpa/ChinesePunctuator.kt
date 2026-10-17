@@ -62,6 +62,17 @@ internal class ChinesePunctuator(
         }
     }
 
+    /**
+     * Punctuation for a partial hypothesis. The model ends every input with a
+     * full stop, but a partial's end is not a sentence end: drop a trailing
+     * terminator so the session keeps treating the tail as still live and
+     * only the sentences already closed inside it as settled.
+     */
+    fun punctuatePartial(text: String): String {
+        val punctuated = punctuate(text)
+        return if (punctuated.isNotEmpty() && punctuated.last() in TERMINATORS) punctuated.dropLast(1) else punctuated
+    }
+
     fun release() {
         synchronized(lock) {
             punctuation?.release()
@@ -71,5 +82,6 @@ internal class ChinesePunctuator(
 
     private companion object {
         const val TAG = "ChinesePunctuator"
+        val TERMINATORS = setOf('。', '？', '！', '.', '?', '!')
     }
 }

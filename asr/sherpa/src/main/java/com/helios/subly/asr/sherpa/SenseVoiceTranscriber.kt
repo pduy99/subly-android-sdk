@@ -203,7 +203,7 @@ class SenseVoiceTranscriber internal constructor(
                     partialIntervalMs = maxOf(MIN_PARTIAL_INTERVAL_MS, decodeMs * 2)
                     if (text.isNotBlank() && text != lastPartial) {
                         lastPartial = text
-                        emit(AsrResult.Partial(text))
+                        emit(AsrResult.Partial(if (language == "zh" || language == "yue") punctuator.punctuatePartial(text) else text))
                     }
                 }
             }

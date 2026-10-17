@@ -178,7 +178,10 @@ class SherpaOnnxTranscriber internal constructor(
                     lastEmittedText = text
                     lastPartialEmitMs = now
                     Log.d(TAG, "Emitted partial packet (length=${text.length})")
-                    emit(AsrResult.Partial(text))
+                    // Punctuated so the session can settle the sentences
+                    // already closed inside a long run (and translate them
+                    // once) instead of retranslating the whole run.
+                    emit(AsrResult.Partial(punctuatePartial(text)))
                 }
             }
             .onCompletion { cause ->
@@ -416,4 +419,7 @@ class SherpaOnnxTranscriber internal constructor(
 
     private fun punctuate(text: String): String =
         if ("zh" in model.languages) punctuator.punctuate(text) else text
+
+    private fun punctuatePartial(text: String): String =
+        if ("zh" in model.languages) punctuator.punctuatePartial(text) else text
 }
