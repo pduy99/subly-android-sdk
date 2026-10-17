@@ -17,6 +17,7 @@ import com.helios.subly.core.downloader.OkHttpModelDownloader
 import com.helios.subly.core.model.AccelerationAware
 import com.helios.subly.core.model.AccelerationReport
 import com.helios.subly.core.model.BackendAttempt
+import com.helios.subly.core.model.DelegateCrashGuard
 import com.helios.subly.core.model.DelegateType
 import com.helios.subly.core.model.LanguageConfig
 import com.helios.subly.core.model.ModelPrepState
@@ -369,19 +370,16 @@ class LiteRtLmTranslator internal constructor(
      * generation, under a crash marker.
      */
     private fun tryDelegate(delegate: DelegateType): Pair<BackendAttempt, Result<Engine>> {
-        val marker = crashMarker(delegate)
-        if (delegate != DelegateType.CPU && marker.exists()) {
-            val age = System.currentTimeMillis() - marker.lastModified()
-            if (age < CRASH_MARKER_TTL_MS) {
-                val note = "skipped: the process died during init on this delegate ${age / 60_000} min ago"
+        val guard = DelegateCrashGuard(context, crashMarker(delegate))
+        if (delegate != DelegateType.CPU) {
+            guard.skipReason()?.let { note ->
                 return BackendAttempt(delegate, succeeded = false, initMs = 0, failure = note) to
                     Result.failure(IllegalStateException(note))
             }
         }
 
         val start = System.nanoTime()
-        marker.parentFile?.mkdirs()
-        runCatching { marker.writeText(delegate.name) }
+        guard.arm(delegate.name)
         val result = runCatching {
             val candidate = Engine(
                 EngineConfig(
@@ -405,7 +403,7 @@ class LiteRtLmTranslator internal constructor(
                 throw t
             }
         }
-        marker.delete()
+        guard.disarm()
         val ms = (System.nanoTime() - start) / 1_000_000
         val attempt = BackendAttempt(
             delegate = delegate,
@@ -469,9 +467,6 @@ class LiteRtLmTranslator internal constructor(
         const val PROBE_OUTPUT_TOKENS = 4
 
         const val CRASH_MARKER_DIR = "litertlm/init-guard"
-
-        /** A delegate that crashed the process is retried after a day. */
-        const val CRASH_MARKER_TTL_MS = 24L * 60 * 60 * 1000
 
         val DEFAULT_DELEGATES = listOf(DelegateType.GPU, DelegateType.CPU)
     }

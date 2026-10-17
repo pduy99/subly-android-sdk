@@ -6,6 +6,7 @@ import com.helios.subly.asr.api.SublyAsr
 import com.helios.subly.core.model.AccelerationAware
 import com.helios.subly.core.model.AccelerationReport
 import com.helios.subly.core.model.BackendAttempt
+import com.helios.subly.core.model.DelegateCrashGuard
 import com.helios.subly.core.model.DelegateType
 import com.helios.subly.core.model.AsrResult
 import com.helios.subly.core.model.AudioFrame
@@ -99,11 +100,9 @@ class WhisperTranscriber(
         // for q5_1, so a q5_1 model on the GPU would run its matmuls on the
         // CPU anyway.
         val gpuDevice = if (preferGpu) runCatching { backend.gpuDevice() }.getOrDefault("") else ""
-        val gpuMarker = File(context.filesDir, GPU_CRASH_MARKER)
-        val gpuCrashedAgoMs = gpuMarker.takeIf { it.exists() }
-            ?.let { System.currentTimeMillis() - it.lastModified() }
-            ?.takeIf { it < GPU_CRASH_MARKER_TTL_MS }
-        val tryGpu = gpuDevice.isNotEmpty() && gpuCrashedAgoMs == null
+        val gpuGuard = DelegateCrashGuard(context, File(context.filesDir, GPU_CRASH_MARKER))
+        val gpuSkipReason = if (gpuDevice.isNotEmpty()) gpuGuard.skipReason() else null
+        val tryGpu = gpuDevice.isNotEmpty() && gpuSkipReason == null
         val asset = modelAsset ?: if (tryGpu) GPU_MODEL_ASSET else DEFAULT_MODEL_ASSET
 
         val modelPath = runCatching {
@@ -141,11 +140,10 @@ class WhisperTranscriber(
         val attempts = ArrayList<BackendAttempt>()
         var created = 0L
         if (tryGpu) {
-            gpuMarker.parentFile?.mkdirs()
-            runCatching { gpuMarker.writeText(gpuDevice) }
+            gpuGuard.arm(gpuDevice)
             val start = System.nanoTime()
             created = backend.init(modelPath, targetLangRef.get(), vadPath, glossary.trim(), useGpu = true)
-            gpuMarker.delete()
+            gpuGuard.disarm()
             attempts += BackendAttempt(
                 DelegateType.GPU,
                 succeeded = created != 0L,
@@ -157,8 +155,8 @@ class WhisperTranscriber(
                 DelegateType.GPU,
                 succeeded = false,
                 initMs = 0,
-                failure = if (gpuCrashedAgoMs != null) {
-                    "skipped: the process died during GPU init ${gpuCrashedAgoMs / 60_000} min ago"
+                failure = if (gpuSkipReason != null) {
+                    gpuSkipReason
                 } else {
                     "no OpenCL GPU device (libOpenCL.so missing or not exposed to apps)"
                 },
@@ -422,9 +420,6 @@ class WhisperTranscriber(
 
         /** Survives a native crash during GPU init; see prepareModel. */
         private const val GPU_CRASH_MARKER = "whisper/init-guard/GPU.init"
-
-        /** A GPU path that crashed the process is retried after a day. */
-        private const val GPU_CRASH_MARKER_TTL_MS = 24L * 60 * 60 * 1000
         /** ggml Silero VAD model (~885 KB) on the `ggml-org/whisper-vad` repo. */
         const val DEFAULT_VAD_ASSET = "ggml-silero-v5.1.2.bin"
         private const val WHISPER_SAMPLE_RATE = 16_000

@@ -73,8 +73,8 @@ enum class LiteRtLmModel(
      * Apache-2.0, ungated. The non-thinking instruct release, so it answers
      * without a reasoning preamble. Larger and slower to decode than the
      * 1.5B default, for markedly better translation; the KV cache alone can
-     * reach 2 x 36 layers x 8 KV heads x 128 x 4 bytes x 2048 tokens =
-     * 576 MiB.
+     * reach 2 x 36 layers x 8 KV heads x 128 x 4 bytes x 1024 tokens =
+     * 288 MiB.
      */
     QWEN3_4B_INSTRUCT_2507_INT4(
         fileName = "qwen3_4b_instruct_2507_mixed_int4.litertlm",
@@ -84,8 +84,11 @@ enum class LiteRtLmModel(
                 "4d409771b414d86b270ca54d27ffc45032a81142/" +
                 "qwen3_4b_instruct_2507_mixed_int4.litertlm",
         approxSizeBytes = 2_659_057_664L,
-        // The export's full context; a caption never comes close.
-        maxNumTokens = 2048,
+        // Half the export's 2048-token context. A sentence's conversation
+        // (system prompt ~60 tokens, a few pieces, their translations) stays
+        // well under 1024, and the fp32 KV cache drops from 576 to 288 MiB:
+        // the 4B pipeline was being killed for memory on a 12 GB phone.
+        maxNumTokens = 1024,
         // Qwen3's model card claims 119 languages; listed are those the SDK's
         // recognisers can transcribe.
         supportedLanguages = listOf(
@@ -100,11 +103,12 @@ enum class LiteRtLmModel(
         val Default: LiteRtLmModel = QWEN2_5_1_5B_INSTRUCT_Q8
 
         /**
-         * Below this much RAM the 4B model's ~1.5 GB working set plus the
-         * recogniser's leaves too little for the rest of the phone. 8 GB
-         * devices report roughly 7.3 to 7.6 GB total.
+         * The 4B model only on 12 GB-class phones (a 12 GB Galaxy S24 Ultra
+         * reports 11.35 GB). On that phone the app reached 5.4-6.3 GB RSS
+         * preparing the 4B model on the GPU next to whisper, and was killed
+         * for memory; an 8 GB phone has no room for it at all.
          */
-        private const val LARGE_MODEL_MIN_RAM_BYTES = 7_000_000_000L
+        private const val LARGE_MODEL_MIN_RAM_BYTES = 10_500_000_000L
 
         /**
          * The best model this device can hold.

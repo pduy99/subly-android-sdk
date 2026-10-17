@@ -31,7 +31,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.transformWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -238,10 +238,21 @@ class SublySession internal constructor(
     private suspend fun runPreparation() {
         var reachedReady = false
 
-        combine(
-            asrEngine.prepareModel(config),
-            translationEngine.prepareModel(config),
-        ) { asr, trans -> asr to trans }
+        // One engine after the other, not both at once. Each engine's init
+        // peak (weights memory-mapped while being uploaded to the GPU, kernel
+        // compilation) is its largest allocation, and overlapping a 4B LLM's
+        // with whisper's got the app killed by the low-memory killer on a
+        // 12 GB phone. Costs first-run time: the translator's download no
+        // longer overlaps the recogniser's.
+        flow {
+            var asrLast: ModelPrepState = ModelPrepState.Checking
+            asrEngine.prepareModel(config)
+                .transformWhile { emit(it); it !is ModelPrepState.Ready && it !is ModelPrepState.Error }
+                .collect { asrLast = it; emit(it to ModelPrepState.Checking) }
+            if (asrLast is ModelPrepState.Ready) {
+                translationEngine.prepareModel(config).collect { emit(ModelPrepState.Ready to it) }
+            }
+        }
             .transformWhile { pair ->
                 emit(pair)
                 val (asr, trans) = pair
