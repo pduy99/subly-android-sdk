@@ -68,4 +68,22 @@ class TranslationPromptTest {
     fun `a single newline inside the translation is kept`() {
         assertEquals("Dòng một\nDòng hai", TranslationPrompt.clean("Dòng một\nDòng hai"))
     }
+
+    @Test
+    fun `context lines are fenced off from the line to translate`() {
+        val message = TranslationPrompt.withContext(
+            "你是这个卖家",
+            listOf("真便宜啊" to "Rẻ thật đấy."),
+        )
+        assertEquals(
+            "Context (earlier lines, already translated; do not translate):\n" +
+                "真便宜啊 => Rẻ thật đấy.\n\nTranslate:\n你是这个卖家",
+            message,
+        )
+    }
+
+    @Test
+    fun `no context is just the line`() {
+        assertEquals("你好", TranslationPrompt.withContext("你好", emptyList()))
+    }
 }

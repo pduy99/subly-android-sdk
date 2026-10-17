@@ -43,9 +43,30 @@ internal object TranslationPrompt {
         return "You are a live subtitle translation engine. The user sends one $source " +
             "sentence in consecutive pieces. Translate each piece into $target as the " +
             "continuation of your previous replies, so that your replies joined in order " +
-            "read as one fluent $target sentence. Reply with the translation of the newest " +
+            "read as one fluent $target sentence. A message may start with earlier subtitle " +
+            "lines marked as context; use them to resolve who is speaking and what is meant, " +
+            "but never translate or repeat them. Reply with the translation of the newest " +
             "piece only: never repeat earlier pieces, no explanation, no notes, no quotation " +
             "marks, and no romanisation."
+    }
+
+    /**
+     * The first message of a sentence, with the previous lines of the
+     * conversation as context.
+     *
+     * Subtitles are dialogue: a line like "你是这个卖家" drops its subject or
+     * refers back, and translated alone it comes out as "Là người bán này"
+     * with "you" lost. One or two earlier lines, already translated, are
+     * enough to resolve that. They are clearly fenced so the model translates
+     * only the new line.
+     */
+    fun withContext(piece: String, context: List<Pair<String, String>>): String {
+        if (context.isEmpty()) return piece
+        return buildString {
+            append("Context (earlier lines, already translated; do not translate):\n")
+            for ((source, translation) in context) append(source).append(" => ").append(translation).append('\n')
+            append("\nTranslate:\n").append(piece)
+        }
     }
 
     /**

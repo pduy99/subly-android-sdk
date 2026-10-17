@@ -96,6 +96,8 @@ class SublySession internal constructor(
     // Japanese is a recogniser artefact either way, not a formatting choice.
     private var cjkSpacing = CjkSpacing(initialConfig.source)
 
+    private var cjkSplitter = CjkSentenceSplitter(initialConfig.source)
+
     private fun punctuationFor(config: LanguageConfig): PunctuationRestorer? =
         if (restorePunctuation) PunctuationRestorer(config.source) else null
 
@@ -241,6 +243,7 @@ class SublySession internal constructor(
         config = newConfig
         punctuation = punctuationFor(newConfig)
         cjkSpacing = CjkSpacing(newConfig.source)
+        cjkSplitter = CjkSentenceSplitter(newConfig.source)
         _translationState.value = TranslationState.Idle
         _state.value = EngineState.Idle
         // Cancellation is cooperative: wait for the old work to unwind so
@@ -450,11 +453,13 @@ class SublySession internal constructor(
             // Finals go through the stage when there is one, so they reuse the
             // clauses it already translated; otherwise they are translated here.
             suspend fun emitFinal(sentence: String, kind: String) {
-                if (stage != null) {
-                    BenchLog.transcript("final_source kind=$kind src=\"$sentence\"")
-                    stage.onFinal(sentence)
-                } else {
-                    send(buildFinalCaption(sentence, kind))
+                for (part in cjkSplitter.split(sentence)) {
+                    if (stage != null) {
+                        BenchLog.transcript("final_source kind=$kind src=\"$part\"")
+                        stage.onFinal(part)
+                    } else {
+                        send(buildFinalCaption(part, kind))
+                    }
                 }
             }
 
@@ -600,6 +605,7 @@ class SublySession internal constructor(
             StageMetric.Kind.FINAL -> "translate_final_latency"
             StageMetric.Kind.FORCED_COMMIT -> "waitk_forced_commit"
             StageMetric.Kind.FINAL_TTFT -> "translate_final_ttft"
+            StageMetric.Kind.MERGED_FINALS -> "translate_merged_finals"
         }
         BenchLog.metric("$name ms=${metric.ms} src_len=${metric.sourceChars}")
         _stageMetrics.tryEmit(metric)

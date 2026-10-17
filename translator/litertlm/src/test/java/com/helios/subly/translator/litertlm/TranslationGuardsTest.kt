@@ -1,5 +1,6 @@
 package com.helios.subly.translator.litertlm
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -98,5 +99,25 @@ class TranslationGuardsTest {
         assertFalse(
             TranslationGuards.isDegenerate("Rất rất tốt, cảm ơn bạn nhiều lắm nhé.")
         )
+    }
+
+    @Test
+    fun `leaked Han characters are removed from a Vietnamese translation`() {
+        assertEquals(
+            "ở nhà là vân thời.",
+            TranslationGuards.stripHanLeak("ở nhà là vân thời小时.", "vi"),
+        )
+        assertEquals("Tôi ăn táo.", TranslationGuards.stripHanLeak("Tôi 吃 ăn táo.", "vi"))
+    }
+
+    @Test
+    fun `Han characters are kept for targets written with them`() {
+        assertEquals("我吃苹果。", TranslationGuards.stripHanLeak("我吃苹果。", "zh"))
+        assertEquals("りんごを食べる。", TranslationGuards.stripHanLeak("りんごを食べる。", "ja"))
+    }
+
+    @Test
+    fun `text without Han characters is untouched`() {
+        assertEquals("Không biết.", TranslationGuards.stripHanLeak("Không biết.", "vi"))
     }
 }

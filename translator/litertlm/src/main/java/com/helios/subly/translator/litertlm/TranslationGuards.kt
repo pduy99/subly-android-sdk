@@ -83,6 +83,36 @@ internal object TranslationGuards {
     private val WHITESPACE = Regex("\\s+")
 
     /**
+     * Removes Han characters the model left untranslated in a target that is
+     * not written with them.
+     *
+     * Small LLMs translating from Chinese sometimes copy a word through
+     * instead of translating it ("…ở nhà là vân thời小时." for Vietnamese,
+     * observed on device). A reader of the target language cannot read it,
+     * so it is dropped; retrying would cost another multi-second generation
+     * for, usually, one word. Targets that do use Han characters (Chinese,
+     * Japanese, Cantonese) are returned unchanged.
+     *
+     * @return the cleaned text, or [translated] itself when nothing leaked.
+     */
+    fun stripHanLeak(translated: String, targetTag: String): String {
+        if (targetTag.substringBefore('-').lowercase() in HAN_TARGETS) return translated
+        if (translated.none(::isHan)) return translated
+        return translated
+            .replace(HAN_RUN, " ")
+            .replace(WHITESPACE, " ")
+            .replace(SPACE_BEFORE_PUNCTUATION, "$1")
+            .trim()
+    }
+
+    private fun isHan(ch: Char): Boolean = Character.UnicodeScript.of(ch.code) == Character.UnicodeScript.HAN
+
+    /** Targets whose writing system includes Han characters. */
+    private val HAN_TARGETS = setOf("zh", "ja", "yue")
+    private val HAN_RUN = Regex("\\p{IsHan}+")
+    private val SPACE_BEFORE_PUNCTUATION = Regex("\\s+([.,!?;:…])")
+
+    /**
      * Below this a verbatim echo is plausibly the right answer — see
      * [isSourceEcho].
      */

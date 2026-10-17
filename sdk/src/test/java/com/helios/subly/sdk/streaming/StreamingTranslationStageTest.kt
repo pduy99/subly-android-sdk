@@ -70,9 +70,10 @@ class StreamingTranslationStageTest {
         language: String,
         states: MutableList<TranslationState>,
         metrics: MutableList<StageMetric> = mutableListOf(),
+        drafts: Boolean = true,
     ) = StreamingTranslationStage(
         translator = translator,
-        policy = WaitKPolicy.forLanguage(language),
+        policy = WaitKPolicy.forLanguage(language).copy(drafts = drafts),
         onState = { states += it },
         onMetric = { metrics += it },
         nanoTime = { testScheduler.currentTime * 1_000_000 },
@@ -240,6 +241,60 @@ class StreamingTranslationStageTest {
             states.none { it is TranslationState.Partial && it.source == "the man." },
         )
         assertEquals("le homme", (states.last() as TranslationState.Finalized).text)
+    }
+
+    @Test
+    fun `without drafts, finals queued behind a generation are translated as one`() = runTest {
+        val translator = FakeTranslator(english, tokenDelayMs = 1_000)
+        val states = mutableListOf<TranslationState>()
+        val metrics = mutableListOf<StageMetric>()
+        val stage = stage(translator, "en", states, metrics, drafts = false)
+        val worker = launch { stage.run() }
+
+        stage.onFinal("the man.")
+        testScheduler.advanceTimeBy(500) // generating "the man."
+        stage.onFinal("a man.")
+        stage.onFinal("the door.")
+        stage.finish()
+        worker.join()
+
+        assertEquals(listOf("the man.", "a man. the door."), translator.appends)
+        val finals = states.filterIsInstance<TranslationState.Finalized>()
+        assertEquals(listOf("the man.", "a man. the door."), finals.map { it.source })
+        assertEquals(2L, metrics.single { it.kind == StageMetric.Kind.MERGED_FINALS }.ms)
+    }
+
+    @Test
+    fun `merging stops before a sentence gets too long`() = runTest {
+        val translator = FakeTranslator(english, tokenDelayMs = 1_000)
+        val stage = stage(translator, "en", mutableListOf(), drafts = false)
+        val worker = launch { stage.run() }
+
+        stage.onFinal("the man.")
+        testScheduler.advanceTimeBy(500)
+        val long = "the man who lives next door ".repeat(2).trim() + "."
+        stage.onFinal(long)
+        stage.onFinal(long)
+        stage.finish()
+        worker.join()
+
+        assertEquals(listOf("the man.", long, long), translator.appends)
+    }
+
+    @Test
+    fun `Chinese sentences merge without a space`() = runTest {
+        val translator = FakeTranslator(emptyMap(), tokenDelayMs = 1_000)
+        val stage = stage(translator, "zh", mutableListOf(), drafts = false)
+        val worker = launch { stage.run() }
+
+        stage.onFinal("真便宜啊。")
+        testScheduler.advanceTimeBy(100)
+        stage.onFinal("你是这个卖家？")
+        stage.onFinal("对，是我。")
+        stage.finish()
+        worker.join()
+
+        assertEquals("你是这个卖家？对，是我。", translator.appends.last())
     }
 
     @Test

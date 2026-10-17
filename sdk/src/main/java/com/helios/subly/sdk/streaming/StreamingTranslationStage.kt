@@ -57,6 +57,12 @@ data class StageMetric(val kind: Kind, val ms: Long, val sourceChars: Int) {
          * reader waits for after the speaker stops.
          */
         FINAL_TTFT,
+
+        /**
+         * Queued finals translated as one generation; [StageMetric.ms] is the
+         * number merged.
+         */
+        MERGED_FINALS,
     }
 }
 
@@ -209,6 +215,7 @@ class StreamingTranslationStage(
      */
     private fun nextWork(): Event? {
         val first = queue.removeFirstOrNull() ?: return null
+        if (first is Final) return mergeQueuedFinals(first)
         if (first !is Commit) return first
 
         var merged: Commit = first
@@ -232,6 +239,48 @@ class StreamingTranslationStage(
                 }
             }
         }
+    }
+
+    /**
+     * Without drafts, finals that queued up behind a running generation are
+     * translated as one: each generation pays ~1.5 s before its first token
+     * on the measured device, and fast dialogue produced lines faster than
+     * that, so latency grew line by line (1.8 s to 13.4 s over a minute).
+     * Merging caps the backlog at one generation. Merged sentences become
+     * one caption, and the merge stops at [MERGE_MAX_CHARS] so a translation
+     * never gets long enough to be slow for its own sake.
+     *
+     * With drafts on, sentences have pieces in their own segments and are
+     * not merged.
+     */
+    private fun mergeQueuedFinals(first: Final): Final {
+        if (policy.drafts) return first
+        var merged = first
+        var count = 1
+        while (true) {
+            val next = queue.firstOrNull() as? Final ?: break
+            val joined = joinSentences(merged.sentence, next.sentence)
+            if (joined.length > MERGE_MAX_CHARS) break
+            queue.removeFirst()
+            merged = Final(joined, FinalDelta.Continue(joined), next.sentenceId, first.enqueuedAt)
+            count++
+        }
+        if (count > 1) onMetric(StageMetric(StageMetric.Kind.MERGED_FINALS, count.toLong(), merged.sentence.length))
+        return merged
+    }
+
+    /** Joins two sentences, without a space between unspaced-script text. */
+    private fun joinSentences(a: String, b: String): String {
+        val unspaced = a.isNotEmpty() && b.isNotEmpty() &&
+            isUnspaced(a.last()) && isUnspaced(b.first())
+        return if (unspaced) a + b else "$a $b"
+    }
+
+    private fun isUnspaced(ch: Char): Boolean {
+        val script = Character.UnicodeScript.of(ch.code)
+        return script == Character.UnicodeScript.HAN || script == Character.UnicodeScript.HIRAGANA ||
+            script == Character.UnicodeScript.KATAKANA || script == Character.UnicodeScript.THAI ||
+            ch in "。！？，、；：…"
     }
 
     /** Earliest enqueue time of commits folded into a final, for its TTFT. */
@@ -355,5 +404,12 @@ class StreamingTranslationStage(
 
     private companion object {
         const val TAG = "StreamingTranslation"
+
+        /**
+         * Longest merged sentence: about two short subtitle lines in Chinese,
+         * a long one in English. Long enough to clear a backlog, short enough
+         * that one generation stays a couple of seconds.
+         */
+        const val MERGE_MAX_CHARS = 60
     }
 }

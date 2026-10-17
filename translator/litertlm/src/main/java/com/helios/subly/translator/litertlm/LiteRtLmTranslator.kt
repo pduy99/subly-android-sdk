@@ -129,6 +129,13 @@ class LiteRtLmTranslator internal constructor(
 
     private val inferenceLock = Mutex()
 
+    /**
+     * The last few completed sentences and their translations, oldest first,
+     * fed to the next sentence as context. Cleared when the language pair
+     * changes: context in another language would only confuse.
+     */
+    private val recentLines = ArrayDeque<Pair<String, String>>()
+
     /** The conversation generating right now, so [release] can cancel it. */
     @Volatile
     private var activeConversation: Conversation? = null
@@ -190,10 +197,17 @@ class LiteRtLmTranslator internal constructor(
 
                 var raw = ""
                 activeConversation = conv
+                // The sentence's first message carries the conversation so
+                // far; later pieces already have it in the conversation.
+                val message = if (sources.isEmpty()) {
+                    TranslationPrompt.withContext(piece, synchronized(recentLines) { recentLines.toList() })
+                } else {
+                    piece
+                }
                 try {
-                    streamTokens(conv, piece).collect { chunk ->
+                    streamTokens(conv, message).collect { chunk ->
                         raw = accumulate(raw, chunk)
-                        val shown = TranslationPrompt.clean(raw)
+                        val shown = TranslationGuards.stripHanLeak(TranslationPrompt.clean(raw), targetTag)
                         if (shown.isNotEmpty()) emit(shown)
                     }
                 } finally {
@@ -208,6 +222,13 @@ class LiteRtLmTranslator internal constructor(
         }.flowOn(Dispatchers.Default)
 
         override fun close() {
+            val text = translation
+            if (sources.isNotEmpty() && text.isNotBlank()) {
+                synchronized(recentLines) {
+                    recentLines.addLast(source to text)
+                    while (recentLines.size > CONTEXT_LINES) recentLines.removeFirst()
+                }
+            }
             val conv = conversation ?: return
             conversation = null
             runCatching { conv.close() }
@@ -246,8 +267,10 @@ class LiteRtLmTranslator internal constructor(
         if (soFar.isNotEmpty() && chunk.startsWith(soFar)) chunk else soFar + chunk
 
     // NOTE: never log `source` or `translated` — end-user speech.
-    private fun checkedTranslation(translated: String, source: String, allowBlank: Boolean): String =
-        when {
+    private fun checkedTranslation(raw: String, source: String, allowBlank: Boolean): String {
+        val translated = TranslationGuards.stripHanLeak(raw, targetTag)
+        if (translated.length != raw.length) Log.w(TAG, "Removed untranslated Han characters from a translation")
+        return when {
             translated.isBlank() && allowBlank -> ""
             TranslationGuards.isSourceEcho(translated, source, sourceTag, targetTag) ->
                 error("Model echoed the source instead of translating it.")
@@ -255,6 +278,7 @@ class LiteRtLmTranslator internal constructor(
                 error("Model produced degenerate output (${translated.length} chars).")
             else -> translated
         }
+    }
 
     override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
         emit(ModelPrepState.Checking)
@@ -276,6 +300,9 @@ class LiteRtLmTranslator internal constructor(
         // Language-pair state is cheap and must be refreshed even on the
         // already-prepared fast path — a session can be re-prepared for a
         // different pair against the same warm engine.
+        if (config.source != sourceTag || config.target != targetTag) {
+            synchronized(recentLines) { recentLines.clear() }
+        }
         sourceTag = config.source
         targetTag = config.target
         conversationConfig = buildConversationConfig(
@@ -462,6 +489,12 @@ class LiteRtLmTranslator internal constructor(
 
         /** Generous for one sentence in any target language, bounded for latency. */
         const val MAX_OUTPUT_TOKENS = 256
+
+        /**
+         * Earlier sentences given as context. Two resolve most dropped
+         * subjects in dialogue; each costs ~50 tokens of prefill.
+         */
+        const val CONTEXT_LINES = 2
 
         /** The delegate probe only needs to see decode run. */
         const val PROBE_OUTPUT_TOKENS = 4
