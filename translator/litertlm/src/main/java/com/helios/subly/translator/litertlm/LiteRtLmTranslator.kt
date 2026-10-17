@@ -1,6 +1,7 @@
 package com.helios.subly.translator.litertlm
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
@@ -410,23 +411,37 @@ class LiteRtLmTranslator internal constructor(
 
         val start = System.nanoTime()
         guard.arm(delegate.name)
+        val proven = provenMarker(delegate)
         val result = runCatching {
             val candidate = Engine(
                 EngineConfig(
                     modelPath = loader.modelFile(model).absolutePath,
                     backend = backendFor(delegate),
                     maxNumTokens = model.maxNumTokens,
-                    cacheDir = context.cacheDir.absolutePath,
+                    cacheDir = engineCacheDir(delegate).absolutePath,
                 )
             )
             try {
+                val initStart = System.nanoTime()
                 candidate.initialize()
+                val initMs = (System.nanoTime() - initStart) / 1_000_000
                 // Init alone does not prove a delegate: a GPU path can
                 // initialise and then fail on the first kernel. One short
-                // generation exercises prefill and decode end to end.
-                candidate.createConversation(
-                    buildConversationConfig(TranslationPrompt.systemInstruction("en", "en"), PROBE_OUTPUT_TOKENS)
-                ).use { it.sendMessage("Hi") }
+                // generation exercises prefill and decode end to end. Once
+                // it has passed for this model on this OS build, it is not
+                // repeated: on a 4B model it costs seconds on every start.
+                val probeMs = if (proven.readTextOrNull() == Build.FINGERPRINT) {
+                    0L
+                } else {
+                    val probeStart = System.nanoTime()
+                    candidate.createConversation(
+                        buildConversationConfig(TranslationPrompt.systemInstruction("en", "en"), PROBE_OUTPUT_TOKENS)
+                    ).use { it.sendMessage("Hi") }
+                    proven.parentFile?.mkdirs()
+                    runCatching { proven.writeText(Build.FINGERPRINT) }
+                    (System.nanoTime() - probeStart) / 1_000_000
+                }
+                Log.i(TAG, "$delegate engine init ${initMs}ms, probe ${if (probeMs == 0L) "skipped (proven)" else "${probeMs}ms"}")
                 candidate
             } catch (t: Throwable) {
                 runCatching { candidate.close() }
@@ -453,6 +468,28 @@ class LiteRtLmTranslator internal constructor(
 
     private fun crashMarker(delegate: DelegateType): File =
         File(File(context.filesDir, CRASH_MARKER_DIR), "${model.name}.${delegate.name}.init")
+
+    /** Holds the OS build a delegate last passed its probe on. */
+    private fun provenMarker(delegate: DelegateType): File =
+        File(File(context.filesDir, CRASH_MARKER_DIR), "${model.name}.${delegate.name}.proven")
+
+    /**
+     * Where LiteRT-LM keeps what it compiles at init.
+     *
+     * For the GPU that is the compiled-program cache (5.5 MB for Qwen3-4B),
+     * which turns a 25-55 s init into a fraction of that. It lived in
+     * cacheDir, which Android empties under storage pressure, and the CPU
+     * path's weight cache (2.3 GB for the same model) in the same directory
+     * made that likely. The GPU cache now lives in filesDir, which only the
+     * user clears. The CPU weight cache stays in cacheDir: it is too large
+     * to keep unconditionally, and dropping it costs time, not correctness.
+     */
+    private fun engineCacheDir(delegate: DelegateType): File = when (delegate) {
+        DelegateType.CPU -> context.cacheDir
+        else -> File(context.filesDir, ENGINE_CACHE_DIR).apply { mkdirs() }
+    }
+
+    private fun File.readTextOrNull(): String? = if (exists()) runCatching { readText() }.getOrNull() else null
 
     override fun release() {
         runCatching { activeConversation?.cancelProcess() }
@@ -506,6 +543,8 @@ class LiteRtLmTranslator internal constructor(
         const val PROBE_OUTPUT_TOKENS = 4
 
         const val CRASH_MARKER_DIR = "litertlm/init-guard"
+
+        const val ENGINE_CACHE_DIR = "litertlm/engine-cache"
 
         val DEFAULT_DELEGATES = listOf(DelegateType.GPU, DelegateType.CPU)
     }
