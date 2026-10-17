@@ -71,7 +71,7 @@ data class StageMetric(val kind: Kind, val ms: Long, val sourceChars: Int) {
  */
 class StreamingTranslationStage(
     private val translator: IncrementalTranslator,
-    policy: WaitKPolicy,
+    private val policy: WaitKPolicy,
     private val onState: suspend (TranslationState) -> Unit = {},
     private val onMetric: (StageMetric) -> Unit = {},
     private val nanoTime: () -> Long = System::nanoTime,
@@ -104,6 +104,13 @@ class StreamingTranslationStage(
     /** Sentence the recogniser is on. Advances on every [onFinal]. */
     private var inputSentenceId = 0L
 
+    /**
+     * Newest sentence the recogniser has produced a hypothesis for. A sentence
+     * stays "on screen" until speech for a later one begins, so its final
+     * translation still streams live after its ASR final.
+     */
+    private var liveSentenceId = 0L
+
     /** Sentence the worker is on, and its translation so far. */
     @Volatile
     private var workerSentenceId = 0L
@@ -135,6 +142,7 @@ class StreamingTranslationStage(
     fun onPartial(hypothesis: String) {
         synchronized(lock) {
             if (finished) return
+            liveSentenceId = inputSentenceId
             val forcedBefore = buffer.forcedCommits
             val delta = buffer.onPartial(hypothesis) ?: return
             queue.addLast(Commit(delta, hypothesis, inputSentenceId, nanoTime()))
@@ -245,9 +253,12 @@ class StreamingTranslationStage(
         pendingTtftStart = null
         try {
             val delta = final.delta
-            if (delta is FinalDelta.Diverged || pieceFailed) {
-                // The recogniser rewrote committed text, or the segment was
-                // dropped after a failed piece: translate the whole sentence.
+            val hadPieces = segment != null || workerTranslation.isNotEmpty()
+            if (delta is FinalDelta.Diverged || pieceFailed || policy.restructureOnFinal && hadPieces) {
+                // The recogniser rewrote committed text, the segment was
+                // dropped after a failed piece, or the pieces are in source
+                // order (SOV) and the target needs the sentence restructured:
+                // translate the whole sentence.
                 segment?.close()
                 segment = null
                 workerTranslation = ""
@@ -295,10 +306,11 @@ class StreamingTranslationStage(
             }
             val text = join(settled, pieceSoFar)
             synchronized(lock) { workerTranslation = text }
-            // Only the sentence being spoken gets live partials. A worker that
-            // is behind stays quiet until that sentence's final, rather than
-            // pulling the live caption back to an older sentence.
-            if (sentenceId == synchronized(lock) { inputSentenceId }) {
+            // Live partials only while no later sentence has started. A worker
+            // that is behind stays quiet until that sentence's final, rather
+            // than pulling the live caption back to an older sentence; a
+            // sentence still on screen streams its final translation.
+            if (sentenceId >= synchronized(lock) { liveSentenceId }) {
                 publish(TranslationState.Partial(source, text, stableLength = settled.length))
             }
         }

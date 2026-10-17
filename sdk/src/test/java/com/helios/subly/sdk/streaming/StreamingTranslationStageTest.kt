@@ -79,7 +79,7 @@ class StreamingTranslationStageTest {
     )
 
     @Test
-    fun `SOV sentence is not translated before its verb`() = runTest {
+    fun `SOV sentence drafts its noun phrases and restructures on final`() = runTest {
         val translator = FakeTranslator(japanese)
         val states = mutableListOf<TranslationState>()
         val stage = stage(translator, "ja", states)
@@ -89,17 +89,23 @@ class StreamingTranslationStageTest {
         stage.onPartial("Watashi wa ringo o")
         stage.onPartial("Watashi wa ringo o taberu.")
         advanceUntilIdle()
-        assertTrue("translated before the verb: $states", states.isEmpty())
+        // Noun phrases are drafted (the two commits arrived before the worker
+        // ran, so they merged into one append); the verb is not.
+        assertEquals(listOf("Watashi wa ringo o"), translator.appends)
+        assertTrue(
+            "translated the verb before it was final: $states",
+            states.none { it is TranslationState.Partial && it.text.contains("eat") },
+        )
 
         stage.onFinal("Watashi wa ringo o taberu.")
         stage.finish()
         worker.join()
 
-        assertEquals(listOf("Watashi wa ringo o taberu."), translator.appends)
-        val final = states.last() as TranslationState.Finalized
-        assertEquals("I apples eat", final.text)
-        val firstEat = states.indexOfFirst { it is TranslationState.Partial && it.text.contains("eat") }
-        assertTrue(firstEat == -1 || firstEat >= 0 && translator.appends.size == 1)
+        // The final is not "I" + "apples" + "eat" stitched in source order:
+        // an SOV sentence is retranslated whole so the target can reorder it.
+        assertEquals("Watashi wa ringo o taberu.", translator.appends.last())
+        assertEquals(2, translator.segmentsOpened)
+        assertTrue(states.last() is TranslationState.Finalized)
     }
 
     @Test
@@ -193,6 +199,47 @@ class StreamingTranslationStageTest {
 
         assertEquals("the man who lives next door.", translator.appends.last())
         assertEquals("le homme qui habite à côté porte", (states.last() as TranslationState.Finalized).text)
+    }
+
+    @Test
+    fun `the last sentence streams its final translation`() = runTest {
+        val translator = FakeTranslator(english)
+        val states = mutableListOf<TranslationState>()
+        val stage = stage(translator, "en", states)
+        val worker = launch { stage.run() }
+
+        stage.onFinal("the man.")
+        stage.finish()
+        worker.join()
+
+        assertEquals(
+            listOf(
+                TranslationState.Partial("the man.", "le", 0),
+                TranslationState.Partial("the man.", "le homme", 0),
+                TranslationState.Partial("the man.", "le homme", 0),
+                TranslationState.Finalized("the man.", "le homme"),
+            ),
+            states,
+        )
+    }
+
+    @Test
+    fun `a sentence overtaken by newer speech does not stream`() = runTest {
+        val translator = FakeTranslator(english, tokenDelayMs = 1_000)
+        val states = mutableListOf<TranslationState>()
+        val stage = stage(translator, "en", states)
+        val worker = launch { stage.run() }
+
+        stage.onFinal("the man.")
+        stage.onPartial("a man who") // the next sentence has begun
+        stage.finish()
+        worker.join()
+
+        assertTrue(
+            "stale partials: $states",
+            states.none { it is TranslationState.Partial && it.source == "the man." },
+        )
+        assertEquals("le homme", (states.last() as TranslationState.Finalized).text)
     }
 
     @Test

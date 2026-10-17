@@ -208,9 +208,13 @@ class SubtitlePipeline(
 
     private suspend fun publish(state: SdkTranslationState, done: CompletableDeferred<Unit>) {
         when (state) {
-            is SdkTranslationState.Partial ->
-                if (state.text.isNotBlank()) states.emit(TranslationState.Partial(state.text))
+            is SdkTranslationState.Partial -> if (state.text.isNotBlank()) {
+                Log.i(TAG, "partial text=\"${state.text}\"")
+                states.emit(TranslationState.Partial(state.text))
+            }
             is SdkTranslationState.Finalized -> {
+                // Test diagnostics: the text an assertion is about.
+                Log.i(TAG, "finalized source=\"${state.source}\" text=\"${state.text}\"")
                 states.emit(TranslationState.Finalized(state.text))
                 done.complete(Unit)
             }

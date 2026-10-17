@@ -7,20 +7,34 @@ import org.junit.Test
 class WaitKBufferTest {
 
     @Test
-    fun `SOV romaji holds the clause until the verb is final`() {
+    fun `SOV romaji commits noun phrases at particles but never an unheard verb`() {
         val buffer = WaitKBuffer(WaitKPolicy.forLanguage("ja"))
 
         assertNull(buffer.onPartial("Watashi wa"))
-        assertNull(buffer.onPartial("Watashi wa ringo o"))
+        assertEquals("Watashi wa", buffer.onPartial("Watashi wa ringo o"))
         // "taberu." is the first hypothesis carrying it, so it is not yet
-        // agreed on, and the stable part has no boundary: still nothing.
-        assertNull(buffer.onPartial("Watashi wa ringo o taberu."))
-        assertEquals("", buffer.committed)
+        // agreed on: only the object phrase before it commits.
+        assertEquals("ringo o", buffer.onPartial("Watashi wa ringo o taberu."))
+        assertEquals("Watashi wa ringo o", buffer.committed)
 
-        assertEquals(
-            FinalDelta.Continue("Watashi wa ringo o taberu."),
-            buffer.onFinal("Watashi wa ringo o taberu."),
-        )
+        assertEquals(FinalDelta.Continue("taberu."), buffer.onFinal("Watashi wa ringo o taberu."))
+    }
+
+    @Test
+    fun `kana particles other than wo never split a word`() {
+        val buffer = WaitKBuffer(WaitKPolicy.forLanguage("ja"))
+
+        // は inside こんにちは must not end a phrase.
+        assertNull(buffer.onPartial("こんにちは今日"))
+        assertNull(buffer.onPartial("こんにちは今日は"))
+        assertEquals("", buffer.committed)
+    }
+
+    @Test
+    fun `SOV policies restructure on final and SVO policies do not`() {
+        assertEquals(true, WaitKPolicy.forLanguage("ja").restructureOnFinal)
+        assertEquals(true, WaitKPolicy.forLanguage("tr").restructureOnFinal)
+        assertEquals(false, WaitKPolicy.forLanguage("en").restructureOnFinal)
     }
 
     @Test

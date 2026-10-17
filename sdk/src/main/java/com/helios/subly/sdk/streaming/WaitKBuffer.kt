@@ -128,6 +128,7 @@ class WaitKBuffer(private val policy: WaitKPolicy) {
     private fun endsClause(units: List<String>, index: Int): Boolean {
         val unit = units[index]
         if (unit.isNotEmpty() && unit.last() in CLAUSE_PUNCTUATION) return true
+        if (normalize(unit) in policy.phraseMarkers) return true
         if (policy.verbFinalMarkers.isEmpty()) return false
         // Markers can span units ("ま" + "す" in unspaced Japanese), so match
         // against the normalized text up to and including this unit.
@@ -235,13 +236,26 @@ enum class WordOrder { SVO, SOV }
  *   clause boundary, the worst-case latency bound.
  * @property verbFinalMarkers normalized (lowercase, letters and digits only)
  *   endings that close a clause in an SOV language.
+ * @property phraseMarkers whole units (normalized) that close a noun phrase,
+ *   such as Japanese case particles. Committing there gives the reader a
+ *   draft before the verb arrives; [restructureOnFinal] then fixes the order.
  */
 data class WaitKPolicy(
     val order: WordOrder,
     val k: Int,
     val maxWaitUnits: Int,
     val verbFinalMarkers: List<String> = emptyList(),
+    val phraseMarkers: Set<String> = emptySet(),
 ) {
+    /**
+     * Whether a sentence's final translation must be generated whole rather
+     * than assembled from its pieces. Pieces of an SOV sentence are
+     * translated in source order ("I" / "apples" / "eat"), which is not the
+     * order an SVO target needs; the pieces serve as live drafts and the
+     * final restructures the sentence.
+     */
+    val restructureOnFinal: Boolean get() = order == WordOrder.SOV
+
     init {
         require(k >= 1) { "k must be at least 1, was $k" }
         require(maxWaitUnits >= k) { "maxWaitUnits ($maxWaitUnits) must be >= k ($k)" }
@@ -264,6 +278,12 @@ data class WaitKPolicy(
                         "ます", "ました", "ません", "ませんでした", "でした", "です", "ましょう",
                         "masu", "mashita", "masen", "desu", "deshita", "mashou",
                     ),
+                    // Case particles that end a noun phrase. In kana only を:
+                    // は, が, に and で also occur inside words (こんにちは),
+                    // and a false phrase end splits a word. Romaji particles
+                    // are separate words, so all are safe. の is excluded in
+                    // both: it joins nouns rather than ending a phrase.
+                    phraseMarkers = setOf("を", "wa", "o", "wo", "ga", "ni", "de", "e", "mo"),
                 )
                 // Declarative/polite/interrogative sentence endings.
                 "ko" -> WaitKPolicy(

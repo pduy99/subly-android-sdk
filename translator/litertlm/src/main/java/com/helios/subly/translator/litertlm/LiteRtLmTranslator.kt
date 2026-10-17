@@ -87,6 +87,8 @@ class LiteRtLmTranslator internal constructor(
      *   prepare. Defaults to a plain [OkHttpModelDownloader]; supply your own
      *   to control how the ~1.6 GB transfer is made (metered-network
      *   policies, a private mirror, resume).
+     * @param model checkpoint to run. Defaults to the best one the device's
+     *   memory allows ([LiteRtLmModel.forDevice]).
      * @param preferredDelegates delegates to try, in order. CPU is always
      *   appended as the last resort if missing. NPU is only useful with a
      *   checkpoint compiled for the device's NPU; the default model is not,
@@ -97,9 +99,10 @@ class LiteRtLmTranslator internal constructor(
         context: Context,
         modelDownloader: ModelDownloader = OkHttpModelDownloader(),
         preferredDelegates: List<DelegateType> = DEFAULT_DELEGATES,
+        model: LiteRtLmModel = LiteRtLmModel.forDevice(context),
     ) : this(
         context = context,
-        model = LiteRtLmModel.Default,
+        model = model,
         loader = LiteRtLmModelLoader(context, modelDownloader),
         threadCount = defaultThreadCount(),
         preferredDelegates = preferredDelegates,
