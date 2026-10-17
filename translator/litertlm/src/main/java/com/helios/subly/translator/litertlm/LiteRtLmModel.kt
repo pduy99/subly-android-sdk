@@ -120,10 +120,21 @@ enum class LiteRtLmModel(
          * token instead of ~0.45 s. Translation that is wrong fast is not a
          * subtitle, so the 4B model is chosen wherever memory allows.
          */
-        fun forDevice(context: Context): LiteRtLmModel {
+        fun forDevice(context: Context): LiteRtLmModel =
+            if (canRunLargeModel(context)) QWEN3_4B_INSTRUCT_2507_INT4 else Default
+
+        /**
+         * Whether this device can run [QWEN3_4B_INSTRUCT_2507_INT4]. Below
+         * that, no catalog model is a good live translator for every pair:
+         * on a Galaxy S10 (7.6 GB) the 4B model took ~10 s to its first token,
+         * Qwen2.5-1.5B answered Chinese with Chinese, and Qwen3-1.7B (tried,
+         * not shipped) drifted into English, Thai and leaked reasoning. Apps
+         * should use a per-pair NMT translator on such devices.
+         */
+        fun canRunLargeModel(context: Context): Boolean {
             val memory = ActivityManager.MemoryInfo()
             context.getSystemService(ActivityManager::class.java)?.getMemoryInfo(memory)
-            return if (memory.totalMem >= LARGE_MODEL_MIN_RAM_BYTES) QWEN3_4B_INSTRUCT_2507_INT4 else Default
+            return memory.totalMem >= LARGE_MODEL_MIN_RAM_BYTES
         }
     }
 }

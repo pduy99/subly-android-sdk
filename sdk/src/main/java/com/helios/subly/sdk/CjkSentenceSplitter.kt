@@ -42,11 +42,15 @@ internal class CjkSentenceSplitter(languageTag: String) {
         val CJK = setOf("zh", "ja", "yue")
         val CLAUSE_MARKS = setOf('，', '、', '；', '：', ',', ';')
 
-        /** About two subtitle lines' worth; longer goes looking for a clause break. */
-        const val MAX_CHARS = 28
+        /**
+         * A subtitle line's worth. Longer goes looking for a clause break:
+         * with punctuation restored, Chinese dialogue arrives as one sentence
+         * of comma-separated lines, and the commas are where the lines are.
+         */
+        const val MAX_CHARS = 18
 
         /** With no clause break, only a run past this is cut blind. */
-        const val HARD_MAX_CHARS = 40
+        const val HARD_MAX_CHARS = 30
 
         /** A split never leaves a fragment shorter than this in front. */
         const val MIN_PART_CHARS = 6

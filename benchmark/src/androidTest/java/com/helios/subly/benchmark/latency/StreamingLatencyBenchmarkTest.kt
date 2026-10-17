@@ -9,6 +9,10 @@ import androidx.test.services.storage.TestStorage
 import com.google.gson.GsonBuilder
 import com.helios.subly.asr.api.SublyAsr
 import com.helios.subly.asr.vosk.VoskTranscriber
+import com.helios.subly.translator.litertlm.LiteRtLmModel
+import com.helios.subly.translator.mlkit.MlKitTranslator
+import com.helios.subly.asr.sherpa.SenseVoiceTranscriber
+import com.helios.subly.asr.sherpa.SherpaOnnxTranscriber
 import com.helios.subly.asr.whisper.WhisperTranscriber
 import com.helios.subly.benchmark.FileAudioCapture
 import com.helios.subly.benchmark.dataset.DatasetManifest
@@ -96,7 +100,19 @@ class StreamingLatencyBenchmarkTest {
         )
         val wanted = args.getString("latencyClips")?.split(',')?.map { it.trim() }?.toSet()
             ?: DEFAULT_CLIPS
-        val clips = manifest.clips.filter { it.id in wanted }
+        // Real-world clips live outside the FLEURS manifest, in realworld/.
+        val realWorld = (instrumentation.context.assets.list("realworld") ?: emptyArray())
+            .filter { it.endsWith(".mp4") }
+            .map { name ->
+                val id = name.removeSuffix(".mp4")
+                DatasetManifest.Clip(
+                    id = id,
+                    language = id.substringBefore('_'),
+                    audio = "../realworld/$name",
+                    durationSec = REALWORLD_DURATION_SEC[id] ?: 60,
+                )
+            }
+        val clips = (manifest.clips + realWorld).filter { it.id in wanted }
         assertTrue("no clips matched $wanted", clips.isNotEmpty())
 
         val memoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -181,8 +197,15 @@ class StreamingLatencyBenchmarkTest {
         val subly = Subly.Builder()
             .setAsrEngine { asrFactory(asrName) }
             .setTranslator {
-                val translator = LiteRtLmTranslator(context)
-                if (baseline) FinalsOnlyTimer(translator, timedCalls) else translator
+                when (val choice = args.getString("latencyTranslator")) {
+                    // Per-pair NMT: translated inline, finals and partials.
+                    "mlkit" -> MlKitTranslator()
+                    else -> {
+                        val translator = if (choice == null) LiteRtLmTranslator(context)
+                        else LiteRtLmTranslator(context, model = LiteRtLmModel.valueOf(choice))
+                        if (baseline) FinalsOnlyTimer(translator, timedCalls) else translator
+                    }
+                }
             }
             .setAudioCapture { TrackedCapture(capture, tracker) }
             .setTranslationDrafts(args.getString("latencyDrafts") != "false")
@@ -316,13 +339,17 @@ class StreamingLatencyBenchmarkTest {
         // latencyWhisperGpu=false pins whisper to the CPU, for A/B runs.
         "whisper" -> WhisperTranscriber(context, preferGpu = args.getString("latencyWhisperGpu") != "false")
         "vosk" -> VoskTranscriber(context)
-        else -> error("unknown latencyAsr '$name' (vosk|whisper)")
+        "sherpa" -> SherpaOnnxTranscriber(context)
+        "sensevoice" -> SenseVoiceTranscriber(context)
+        else -> error("unknown latencyAsr '$name' (vosk|whisper|sherpa|sensevoice)")
     }
 
     private fun copyAssetToCache(assetPath: String): File {
         val out = File.createTempFile("latency", ".mp4", context.cacheDir)
+        // Manifest paths are relative to dataset/; real-world ones step out.
+        val path = if (assetPath.startsWith("../")) assetPath.removePrefix("../") else "dataset/$assetPath"
         out.outputStream().use { dst ->
-            instrumentation.context.assets.open("dataset/$assetPath").use { it.copyTo(dst) }
+            instrumentation.context.assets.open(path).use { it.copyTo(dst) }
         }
         return out
     }
@@ -344,6 +371,9 @@ class StreamingLatencyBenchmarkTest {
             "fleurs_ja_01", "fleurs_ja_02",
             "fleurs_zh_01", "fleurs_zh_02",
         )
+
+        /** Lengths of the real-world clips, which have no manifest entry. */
+        val REALWORLD_DURATION_SEC = mapOf("zh_dialogue_01" to 49)
 
         /** The task specification's targets, recorded against the measurements. */
         const val TARGET_TTFT_MS = 300L

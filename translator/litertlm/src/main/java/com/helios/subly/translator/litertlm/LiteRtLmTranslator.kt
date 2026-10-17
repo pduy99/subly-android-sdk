@@ -81,6 +81,7 @@ class LiteRtLmTranslator internal constructor(
     private val loader: LiteRtLmModelLoader,
     private val threadCount: Int,
     private val preferredDelegates: List<DelegateType>,
+    private val contextLines: Int = DEFAULT_CONTEXT_LINES,
 ) : SublyTranslator, IncrementalTranslator, AccelerationAware {
 
     /**
@@ -101,9 +102,11 @@ class LiteRtLmTranslator internal constructor(
         modelDownloader: ModelDownloader = OkHttpModelDownloader(),
         preferredDelegates: List<DelegateType> = DEFAULT_DELEGATES,
         model: LiteRtLmModel = LiteRtLmModel.forDevice(context),
+        contextLines: Int = DEFAULT_CONTEXT_LINES,
     ) : this(
         context = context,
         model = model,
+        contextLines = contextLines,
         loader = LiteRtLmModelLoader(context, modelDownloader),
         threadCount = defaultThreadCount(),
         preferredDelegates = preferredDelegates,
@@ -226,7 +229,7 @@ class LiteRtLmTranslator internal constructor(
             if (sources.isNotEmpty() && text.isNotBlank()) {
                 synchronized(recentLines) {
                     recentLines.addLast(source to text)
-                    while (recentLines.size > CONTEXT_LINES) recentLines.removeFirst()
+                    while (recentLines.size > contextLines) recentLines.removeFirst()
                 }
             }
             val conv = conversation ?: return
@@ -491,10 +494,13 @@ class LiteRtLmTranslator internal constructor(
         const val MAX_OUTPUT_TOKENS = 256
 
         /**
-         * Earlier sentences given as context. Two resolve most dropped
-         * subjects in dialogue; each costs ~50 tokens of prefill.
+         * Earlier sentences given as context; off by default. Measured on a
+         * Galaxy S10 with small models (Qwen2.5-1.5B, Qwen3-1.7B), context
+         * made the model copy an earlier translation instead of translating
+         * the new line: seven lines in a row came back as the first line's
+         * translation. Unproven on larger models, so it is opt-in.
          */
-        const val CONTEXT_LINES = 2
+        const val DEFAULT_CONTEXT_LINES = 0
 
         /** The delegate probe only needs to see decode run. */
         const val PROBE_OUTPUT_TOKENS = 4

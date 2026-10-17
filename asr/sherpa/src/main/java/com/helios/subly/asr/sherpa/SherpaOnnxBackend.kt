@@ -37,7 +37,7 @@ internal interface SherpaOnnxBackend {
     fun isAvailable(): Boolean
 
     /** Returns an opaque recognizer+stream handle, or `null` on failure. */
-    fun init(modelDir: String, sampleRateHz: Int): Handle?
+    fun init(modelDir: String, sampleRateHz: Int, numThreads: Int = 1): Handle?
 
     /** Push PCM (mono, float in [-1, 1]) into the recognizer's stream. */
     fun acceptWaveform(handle: Handle, pcm: FloatArray, sampleRateHz: Int)
@@ -132,7 +132,7 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
 
     override fun isAvailable(): Boolean = available
 
-    override fun init(modelDir: String, sampleRateHz: Int): SherpaOnnxBackend.Handle? {
+    override fun init(modelDir: String, sampleRateHz: Int, numThreads: Int): SherpaOnnxBackend.Handle? {
         if (!available) return null
         val dir = File(modelDir)
         val encoder = resolveOnnx(dir, "encoder")
@@ -155,7 +155,7 @@ private object JniSherpaOnnxBackend : SherpaOnnxBackend {
                         joiner = joiner,
                     ),
                     tokens = "$modelDir/tokens.txt",
-                    numThreads = 1,
+                    numThreads = numThreads,
                     debug = false,
                 ),
                 lmConfig = OnlineLMConfig(),

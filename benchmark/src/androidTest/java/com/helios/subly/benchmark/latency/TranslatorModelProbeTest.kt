@@ -7,6 +7,7 @@ import com.google.gson.GsonBuilder
 import com.helios.subly.core.model.LanguageConfig
 import com.helios.subly.core.model.ModelPrepState
 import com.helios.subly.translator.litertlm.LiteRtLmModel
+import com.helios.subly.translator.mlkit.MlKitTranslator
 import com.helios.subly.translator.litertlm.LiteRtLmTranslator
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -45,13 +46,77 @@ class TranslatorModelProbeTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val wanted = InstrumentationRegistry.getArguments().getString("probeModels")
             ?.split(',')?.map { it.trim() }?.toSet()
-        val models = LiteRtLmModel.entries.filter { wanted == null || it.name in wanted }
+        val samples = when (InstrumentationRegistry.getArguments().getString("probeSamples")) {
+            "zh_vi" -> ZH_VI_SAMPLES
+            else -> SAMPLES
+        }
         val results = ArrayList<Result>()
 
-        for (model in models) {
-            val translator = LiteRtLmTranslator(context, model = model)
+        // ML Kit: per-pair NMT, no LLM memory. Translated with plain
+        // translate() calls; ttft is its whole time, since it does not stream.
+        if (wanted == null || "MLKIT" in wanted) {
+            val mlkit = MlKitTranslator()
             try {
-                for ((pair, samples) in SAMPLES.groupBy { it.source to it.target }) {
+                for ((pair, group) in samples.groupBy { it.source to it.target }) {
+                    val start = System.nanoTime()
+                    val state = withTimeout(PREPARE_TIMEOUT_MS) {
+                        mlkit.prepareModel(LanguageConfig(pair.first, pair.second))
+                            .first { it is ModelPrepState.Ready || it is ModelPrepState.Error }
+                    }
+                    val prepareMs = (System.nanoTime() - start) / 1_000_000
+                    for (sample in group) {
+                        val t0 = System.nanoTime()
+                        val out = runCatching { mlkit.translate(sample.text) }
+                        val ms = (System.nanoTime() - t0) / 1_000_000
+                        results += Result("MLKIT", "CPU", prepareMs, sample.source, sample.target, sample.text,
+                            out.getOrDefault(""), ms, ms,
+                            if (state is ModelPrepState.Error) "prepare failed: ${state.cause}" else out.exceptionOrNull()?.toString())
+                        Log.i(TAG, "probe ${results.last()}")
+                    }
+                }
+            } finally {
+                mlkit.release()
+            }
+        }
+
+        // ML Kit through English: zh->en and en->vi are far higher-resource
+        // pairs than zh->vi; does two hops beat one?
+        if (wanted != null && "MLKIT_PIVOT_EN" in wanted) {
+            val first = MlKitTranslator()
+            val second = MlKitTranslator()
+            try {
+                for ((pair, group) in samples.groupBy { it.source to it.target }) {
+                    for ((t, cfg) in listOf(first to LanguageConfig(pair.first, "en"), second to LanguageConfig("en", pair.second))) {
+                        withTimeout(PREPARE_TIMEOUT_MS) {
+                            t.prepareModel(cfg).first { it is ModelPrepState.Ready || it is ModelPrepState.Error }
+                        }
+                    }
+                    for (sample in group) {
+                        val t0 = System.nanoTime()
+                        val out = runCatching { second.translate(first.translate(sample.text)) }
+                        val ms = (System.nanoTime() - t0) / 1_000_000
+                        results += Result("MLKIT_PIVOT_EN", "CPU", 0, sample.source, sample.target, sample.text,
+                            out.getOrDefault(""), ms, ms, out.exceptionOrNull()?.toString())
+                        Log.i(TAG, "probe ${results.last()}")
+                    }
+                }
+            } finally {
+                first.release()
+                second.release()
+            }
+        }
+
+        val models = LiteRtLmModel.entries.filter { wanted == null || it.name in wanted }
+        for (model in models) {
+            val contextLines = InstrumentationRegistry.getArguments().getString("probeContext")?.toInt() ?: 2
+            val delegates = InstrumentationRegistry.getArguments().getString("probeDelegates")
+                ?.split(',')?.map { com.helios.subly.core.model.DelegateType.valueOf(it.trim()) }
+                ?: listOf(com.helios.subly.core.model.DelegateType.GPU, com.helios.subly.core.model.DelegateType.CPU)
+            val translator = LiteRtLmTranslator(
+                context, model = model, contextLines = contextLines, preferredDelegates = delegates,
+            )
+            try {
+                for ((pair, group) in samples.groupBy { it.source to it.target }) {
                     val start = System.nanoTime()
                     val state = withTimeout(PREPARE_TIMEOUT_MS) {
                         translator.prepareModel(LanguageConfig(pair.first, pair.second))
@@ -59,7 +124,7 @@ class TranslatorModelProbeTest {
                     }
                     val prepareMs = (System.nanoTime() - start) / 1_000_000
                     val delegate = translator.accelerationReport?.active?.name ?: "none"
-                    for (sample in samples) {
+                    for (sample in group) {
                         results += if (state is ModelPrepState.Error) {
                             Result(model.name, delegate, prepareMs, sample.source, sample.target, sample.text,
                                 "", -1, -1, "prepare failed: ${state.cause}")
@@ -125,5 +190,15 @@ class TranslatorModelProbeTest {
             Sample("en", "vi", "The quick brown fox jumps over the lazy dog."),
             Sample("en", "vi", "Alloys are basically a mixture of two or more metals."),
         )
+
+        /** Lines of realworld/zh_dialogue_01 (its subtitles) and FLEURS zh, to Vietnamese. */
+        val ZH_VI_SAMPLES = listOf(
+            "硬通货随便吃都有。", "真便宜啊！", "你是这个卖家？", "对，是我。走吧。",
+            "等会你就说你是我女儿。", "不是，等会，什么叫我是你女儿？", "我妈撒拉今天聚餐，可以带家属。",
+            "来，把这个头盔戴上。", "那我跟你坐一起吃吗？", "到时候也可以跟你妈坐一起。",
+            "下单后找两个检票员，然后盯着眨眼三次。", "你想干嘛？票呢？",
+            "他没有设定削减数额，只是表示将根据中国的经济产出来决定数额。",
+            "合金基本上由两种或以上金属混合而成。",
+        ).map { Sample("zh", "vi", it) }
     }
 }

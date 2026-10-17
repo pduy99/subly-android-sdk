@@ -16,7 +16,7 @@ class CjkSentenceSplitterTest {
     fun `long sentences split at clause punctuation`() {
         val s = "那我跟你坐一起吃吗，到时候也可以跟你妈坐一起，我妈应该会来。"
         assertEquals(
-            listOf("那我跟你坐一起吃吗，到时候也可以跟你妈坐一起，", "我妈应该会来。"),
+            listOf("那我跟你坐一起吃吗，", "到时候也可以跟你妈坐一起，", "我妈应该会来。"),
             zh.split(s),
         )
     }
@@ -31,7 +31,7 @@ class CjkSentenceSplitterTest {
 
     @Test
     fun `an unpunctuated sentence under the hard cap is kept whole`() {
-        val s = "带上我跟你们一起吃吗到时候也会给你妈做一些我们应该会"
+        val s = "带上我跟你们一起吃吗到时候也会给你妈做"
         assertEquals(listOf(s), zh.split(s))
     }
 

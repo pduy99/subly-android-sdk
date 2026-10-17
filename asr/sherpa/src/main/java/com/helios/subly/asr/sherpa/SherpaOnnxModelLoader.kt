@@ -103,6 +103,14 @@ internal open class SherpaOnnxModelLoader(
             downloader.downloadModel(url, dest).collect { fileProgress ->
                 emit(((index + fileProgress) / total).coerceIn(0f, 1f))
             }
+            model.sha256[fileName]?.let { expected ->
+                val actual = sha256Of(dest)
+                if (!actual.equals(expected, ignoreCase = true)) {
+                    Log.e(TAG, "$fileName failed its SHA-256 check (got $actual); deleted.")
+                    dest.delete()
+                    return@flow
+                }
+            }
         }
         Log.i(TAG, "Downloaded ${model.dirName} -> ${target.absolutePath}")
         emit(1f)
@@ -186,5 +194,19 @@ internal open class SherpaOnnxModelLoader(
         const val TAG = "SherpaOnnxModelLoader"
         const val MODELS_DIR = "sherpa-onnx"
         const val ASSETS_DIR = "sherpa-onnx"
+    }
+
+    private fun sha256Of(file: File): String {
+        if (!file.exists()) return ""
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(1 shl 16)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 }
