@@ -283,7 +283,9 @@ was several subtitle lines in one run, so `ChinesePunctuator` (CT-Transformer,
 int8, SHA-256-verified) restores 。，？ in finals and partials, and
 `CjkSentenceSplitter` cuts at clause punctuation (18 characters). **Measured in
 the shipping app** (system-audio capture of the clip played in the phone's video
-player): **14.5% character error**, with subtitle-sized lines.
+player): **14.5% character error in Streaming mode (15.8% on a second run) and
+13.9% in Batch mode**, with subtitle-sized lines, against ~60% for the Vosk
+pipeline it replaces.
 
 ### Translation, Chinese → Vietnamese (`TranslatorModelProbeTest`, the clip's lines)
 
