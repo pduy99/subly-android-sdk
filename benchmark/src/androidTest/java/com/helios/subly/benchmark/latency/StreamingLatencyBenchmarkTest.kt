@@ -76,7 +76,8 @@ import java.util.concurrent.CopyOnWriteArrayList
  * ```
  * Optional runner arguments: `latencyAsr` (`vosk`, default, or `whisper`),
  * `latencyClips` (comma-separated clip ids), `latencyWhisperGpu`
- * (`false` keeps whisper on the CPU) and `latencyMode=baseline`, which hides
+ * (`false` keeps whisper on the CPU), `latencyTarget` (overrides the
+ * per-clip target language) and `latencyMode=baseline`, which hides
  * the translator's incremental interface so the session translates finals
  * inline, one call per sentence: the pipeline as it was before streaming
  * translation, measured on the same device, models and clips.
@@ -161,7 +162,7 @@ class StreamingLatencyBenchmarkTest {
     ): ClipLatency {
         val source = requireNotNull(clip.language)
         // SOV and Chinese sources go to English; English goes to Vietnamese.
-        val target = if (source == "en") "vi" else "en"
+        val target = args.getString("latencyTarget") ?: if (source == "en") "vi" else "en"
         val audio = copyAssetToCache(requireNotNull(clip.audio))
         val tracker = VoicedFrameTracker()
         val capture = FileAudioCapture(audio)
@@ -226,12 +227,15 @@ class StreamingLatencyBenchmarkTest {
                     session.accelerationReports().forEach { delegates[it.component] = it }
 
                     session.start()
+                    // Quiet is measured from playback, not from before the
+                    // (tens of seconds of) preparation above.
+                    lastActivityAt = SystemClock.elapsedRealtime()
                     val deadline = SystemClock.elapsedRealtime() +
                         clip.durationSec * 1_000L + FileAudioCapture.TRAILING_SILENCE_MS + PIPELINE_SLACK_MS
                     while (SystemClock.elapsedRealtime() < deadline) {
                         val state = session.state.value
                         if (state is EngineState.Error) return failed("pipeline failed: ${state.error}")
-                        val quiet = SystemClock.elapsedRealtime() - lastActivityAt >= QUIESCENCE_MS
+                        val quiet = SystemClock.elapsedRealtime() - lastActivityAt >= quiescenceMs(asrName)
                         if (capture.finished.isCompleted && quiet) break
                         delay(200)
                     }
@@ -351,8 +355,12 @@ class StreamingLatencyBenchmarkTest {
         /** Time for the last sentence to finish translating after playback. */
         const val PIPELINE_SLACK_MS = 90_000L
 
-        /** No caption for this long after playback means the pipeline is done. */
-        const val QUIESCENCE_MS = 12_000L
+        /**
+         * No caption for this long after playback means the pipeline is done.
+         * Whisper decodes behind real time on harder languages and can go
+         * much longer between finals, as in the accuracy benchmark.
+         */
+        fun quiescenceMs(asr: String): Long = if (asr == "whisper") 90_000L else 12_000L
     }
 }
 

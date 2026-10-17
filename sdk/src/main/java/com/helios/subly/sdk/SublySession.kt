@@ -371,9 +371,11 @@ class SublySession internal constructor(
                             is TranslationState.Partial -> send(
                                 Caption(state.source, state.text, isFinal = false, mode = Caption.CaptureMode.AUDIO)
                             )
-                            is TranslationState.Finalized -> send(
-                                Caption(state.source, state.text, isFinal = true, mode = Caption.CaptureMode.AUDIO)
-                            )
+                            is TranslationState.Finalized -> {
+                                // Content for accuracy evaluation; no-op unless VERBOSE opted in.
+                                BenchLog.transcript("translate_text kind=final src=\"${state.source}\" dst=\"${state.text}\"")
+                                send(Caption(state.source, state.text, isFinal = true, mode = Caption.CaptureMode.AUDIO))
+                            }
                             is TranslationState.Failed -> throw SublyError.TranslationFailed(state.error)
                             TranslationState.Idle -> Unit
                         }
