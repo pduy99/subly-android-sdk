@@ -88,9 +88,14 @@ class WhisperTranscriber(
             return@flow
         }
 
-        targetLangRef.set(config.source.normalizeLangTag())
+        val language = config.source.normalizeLangTag()
+        targetLangRef.set(language)
 
-        if (handleRef.get() != 0L) {
+        // Already loaded: whisper is one multilingual model, so a new source
+        // language is a parameter change on the live context, not a reload.
+        val live = handleRef.get()
+        if (live != 0L) {
+            synchronized(nativeLock) { backend.setLanguage(live, language) }
             emit(ModelPrepState.Ready)
             return@flow
         }

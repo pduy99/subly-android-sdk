@@ -98,7 +98,7 @@ class IncrementalTranslatorSessionTest {
         val asr = FakeAsr()
         val translator = SlowIncrementalTranslator(generationMs = 1_000)
         val session = SublySession(
-            config = LanguageConfig(source = "en", target = "fr"),
+            initialConfig = LanguageConfig(source = "en", target = "fr"),
             audioCapture = FakeCapture(),
             asrEngine = asr,
             translationEngine = translator,
@@ -131,7 +131,7 @@ class IncrementalTranslatorSessionTest {
         val asr = FakeAsr()
         val translator = SlowIncrementalTranslator(generationMs = 1_000)
         val session = SublySession(
-            config = LanguageConfig(source = "en", target = "fr"),
+            initialConfig = LanguageConfig(source = "en", target = "fr"),
             audioCapture = FakeCapture(),
             asrEngine = asr,
             translationEngine = translator,

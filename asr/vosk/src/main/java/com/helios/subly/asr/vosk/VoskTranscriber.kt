@@ -79,6 +79,10 @@ class VoskTranscriber internal constructor(
     /** Lazily-initialized model/recognizer pair. Cleared on [release]. */
     private val handleRef = AtomicReference<VoskBackend.Handle?>(null)
 
+    /** Which language model [handleRef] holds; Vosk models are per language. */
+    @Volatile
+    private var loadedModel: VoskModels? = null
+
     /**
      * Serializes native calls. Vosk's [Recognizer] is not thread-safe;
      * concurrent acceptWaveForm/result calls would corrupt its decoder state.
@@ -175,12 +179,22 @@ class VoskTranscriber internal constructor(
             return@flow
         }
 
+        val model = VoskModels.forLanguage(config.source)
+
+        // Already holding this language's model: nothing to do. Holding
+        // another language's (the session switched languages): free it before
+        // loading the new one, so two models are never resident at once.
         if (handleRef.get() != null) {
-            emit(ModelPrepState.Ready)
-            return@flow
+            if (model == loadedModel) {
+                emit(ModelPrepState.Ready)
+                return@flow
+            }
+            synchronized(nativeLock) {
+                handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+                loadedModel = null
+            }
         }
 
-        val model = VoskModels.forLanguage(config.source)
         if (model == null) {
             emit(
                 ModelPrepState.Error(
@@ -246,7 +260,9 @@ class VoskTranscriber internal constructor(
         }
 
         // If a concurrent prepare won the race, release ours and keep theirs.
-        if (!handleRef.compareAndSet(null, created)) {
+        if (handleRef.compareAndSet(null, created)) {
+            loadedModel = model
+        } else {
             runCatching { backend.release(created) }
         }
 
@@ -256,6 +272,7 @@ class VoskTranscriber internal constructor(
     override fun release() {
         synchronized(nativeLock) {
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+            loadedModel = null
             speechGate?.release()
         }
     }

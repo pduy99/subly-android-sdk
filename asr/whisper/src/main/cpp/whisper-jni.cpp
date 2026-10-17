@@ -640,6 +640,27 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeLastDetectedLang(
     return env->NewStringUTF(handle->last_detected.c_str());
 }
 
+// Switches the source language of a live context without reloading the model:
+// whisper is one multilingual model, and the language is only a decode
+// parameter. The auto-detected pin and the carried context are dropped too:
+// text in the previous language would bias the next window toward it.
+JNIEXPORT void JNICALL
+Java_com_helios_subly_asr_whisper_WhisperNative_nativeSetLanguage(
+        JNIEnv * env, jobject /*thiz*/, jlong handle_ptr, jstring language_jstr) {
+    auto * handle = reinterpret_cast<WhisperHandle *>(handle_ptr);
+    if (!handle) return;
+    handle->target_lang = jstring_to_std(env, language_jstr);
+    {
+        std::lock_guard<std::mutex> lk(handle->detected_mu);
+        handle->pinned_lang.clear();
+        handle->last_detected.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(handle->prompt_mu);
+        handle->carry.clear();
+    }
+}
+
 JNIEXPORT void JNICALL
 Java_com_helios_subly_asr_whisper_WhisperNative_nativeRelease(
         JNIEnv * /*env*/, jobject /*thiz*/, jlong handle_ptr) {

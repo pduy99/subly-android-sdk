@@ -48,6 +48,9 @@ internal object WhisperNative {
      */
     external fun nativeGpuDevice(): String
 
+    /** Changes the source language of a live context; no model reload. */
+    external fun nativeSetLanguage(handle: Long, languageCode: String)
+
     /**
      * Runs full inference over one PCM window; returns concatenated text.
      *

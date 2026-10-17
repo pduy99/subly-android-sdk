@@ -43,7 +43,7 @@ class Subly private constructor(
      * [SublySession.close] when done.
      */
     fun createSession(config: LanguageConfig): SublySession = SublySession(
-        config = config,
+        initialConfig = config,
         audioCapture = audioCaptureFactory(),
         asrEngine = asrEngineFactory(),
         translationEngine = translatorFactory(),

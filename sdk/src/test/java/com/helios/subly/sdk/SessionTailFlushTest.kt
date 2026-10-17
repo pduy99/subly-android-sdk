@@ -67,7 +67,7 @@ class SessionTailFlushTest {
         // Two short finals, well under the 28-word cap, with no terminator:
         // nothing can escape the pool except an end-of-stream drain.
         val session = SublySession(
-            config = LanguageConfig(source = "en", target = "vi"),
+            initialConfig = LanguageConfig(source = "en", target = "vi"),
             audioCapture = FakeCapture(),
             asrEngine = FakeAsr(listOf("wine and beer might be had", "in any quantity")),
             translationEngine = EchoTranslator(),

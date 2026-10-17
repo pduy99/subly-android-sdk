@@ -78,7 +78,7 @@ class FinalsOnlyTranslatorTest {
 
     private fun runSession(translator: RecordingTranslator): List<Caption> {
         val session = SublySession(
-            config = LanguageConfig(source = "en", target = "vi"),
+            initialConfig = LanguageConfig(source = "en", target = "vi"),
             audioCapture = FakeCapture(),
             asrEngine = FakeAsr(),
             translationEngine = translator,

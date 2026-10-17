@@ -74,21 +74,30 @@ import kotlin.time.Duration.Companion.milliseconds
  * [prepare] or [start].
  */
 class SublySession internal constructor(
-    private val config: LanguageConfig,
+    initialConfig: LanguageConfig,
     private val audioCapture: AudioCapture,
     private val asrEngine: SublyAsr,
     private val translationEngine: SublyTranslator,
-    restorePunctuation: Boolean = true,
+    private val restorePunctuation: Boolean = true,
     private val translationDrafts: Boolean = false,
 ) : AutoCloseable {
 
+    /** Current language pair; replaced by [setLanguages]. */
+    @Volatile
+    private var config: LanguageConfig = initialConfig
+
+    /** The language pair this session prepares and captions for. */
+    val languages: LanguageConfig get() = config
+
     /** Null when disabled — ASR text then reaches the extractor untouched. */
-    private val punctuation: PunctuationRestorer? =
-        if (restorePunctuation) PunctuationRestorer(config.source) else null
+    private var punctuation: PunctuationRestorer? = punctuationFor(initialConfig)
 
     // Independent of restorePunctuation: an inter-word space in Chinese or
     // Japanese is a recogniser artefact either way, not a formatting choice.
-    private val cjkSpacing = CjkSpacing(config.source)
+    private var cjkSpacing = CjkSpacing(initialConfig.source)
+
+    private fun punctuationFor(config: LanguageConfig): PunctuationRestorer? =
+        if (restorePunctuation) PunctuationRestorer(config.source) else null
 
     private val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -199,6 +208,48 @@ class SublySession internal constructor(
 
             _state.value = EngineState.Running
             runPipeline(frames())
+        }
+    }
+
+    /**
+     * Switches the language pair without giving up the engines.
+     *
+     * Preparation runs again against the same engine instances, and each
+     * engine only redoes what the new pair actually needs: the LLM translator
+     * and Whisper keep their loaded models (one is pair-agnostic, the other
+     * multilingual) and just change parameters; Vosk swaps to the new
+     * language's model, releasing the old one first. Compared with closing
+     * the session and creating another, this skips a translator init that
+     * takes 10-30 s and briefly holding two sets of engines.
+     *
+     * A running pipeline is stopped (its sentence assembly is per language);
+     * call [start] again once [state] is [EngineState.Ready]. Same pair as
+     * now: equivalent to [prepare].
+     *
+     * @throws IllegalStateException if the session is [EngineState.Closed].
+     */
+    @Synchronized
+    fun setLanguages(newConfig: LanguageConfig) {
+        checkNotClosed()
+        if (newConfig == config) {
+            prepare()
+            return
+        }
+        val previousPipeline = pipelineJob?.also { it.cancel() }
+        val previousPrep = prepJob?.also { it.cancel() }
+        pipelineJob = null
+        config = newConfig
+        punctuation = punctuationFor(newConfig)
+        cjkSpacing = CjkSpacing(newConfig.source)
+        _translationState.value = TranslationState.Idle
+        _state.value = EngineState.Idle
+        // Cancellation is cooperative: wait for the old work to unwind so
+        // two prepareModel calls never race on the same engine (Vosk freeing
+        // one model while loading another).
+        prepJob = sessionScope.launch {
+            previousPipeline?.join()
+            previousPrep?.join()
+            runPreparation()
         }
     }
 
