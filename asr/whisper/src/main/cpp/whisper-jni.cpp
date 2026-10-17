@@ -13,6 +13,7 @@
 #include <cctype>
 
 #include "whisper.h"
+#include "ggml-backend.h"
 #include "utf8_safe.h"
 
 #define TAG "SublyWhisperJni"
@@ -220,13 +221,32 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeIsAvailable(JNIEnv *, jobj
     return JNI_TRUE;
 }
 
+// First GPU (or integrated GPU) device ggml registered, as "name: description",
+// or "" when there is none: OpenCL missing, the vendor library not exposed to
+// apps, or no usable device. This is the device whisper.cpp would pick with
+// use_gpu set.
+JNIEXPORT jstring JNICALL
+Java_com_helios_subly_asr_whisper_WhisperNative_nativeGpuDevice(JNIEnv * env, jobject) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            std::string desc = std::string(ggml_backend_dev_name(dev)) + ": " +
+                               ggml_backend_dev_description(dev);
+            return env->NewStringUTF(desc.c_str());
+        }
+    }
+    return env->NewStringUTF("");
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
         JNIEnv * env, jobject /*thiz*/,
         jstring model_path_jstr,
         jstring target_language_jstr,
         jstring vad_model_path_jstr,
-        jstring glossary_jstr) {
+        jstring glossary_jstr,
+        jboolean use_gpu) {
 
     std::string model_path = jstring_to_std(env, model_path_jstr);
     std::string target     = jstring_to_std(env, target_language_jstr);
@@ -239,7 +259,10 @@ Java_com_helios_subly_asr_whisper_WhisperNative_nativeInit(
     }
 
     whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = false;
+    // GPU only when the caller found a GPU device and has not seen this
+    // delegate crash before (see WhisperTranscriber). With no GPU device
+    // registered, whisper.cpp runs on the CPU regardless.
+    cparams.use_gpu = use_gpu == JNI_TRUE;
 
     whisper_context * ctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
     if (!ctx) {

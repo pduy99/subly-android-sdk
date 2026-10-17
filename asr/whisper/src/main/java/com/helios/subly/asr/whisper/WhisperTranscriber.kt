@@ -32,12 +32,13 @@ class WhisperTranscriber(
     private val speechSegmenter: SpeechSegmenter = SpeechSegmenter(),
     private val modelDownloader: ModelDownloader = OkHttpModelDownloader(),
     /**
-     * ggml model file name on the `ggerganov/whisper.cpp` HF repo. Defaults
-     * to [DEFAULT_MODEL_ASSET]. Pass `ggml-base-q8_0.bin` or
-     * `ggml-tiny-q8_0.bin` for devices that need a smaller download or
+     * ggml model file name on the `ggerganov/whisper.cpp` HF repo. Null (the
+     * default) picks by delegate: [GPU_MODEL_ASSET] when an OpenCL GPU is
+     * available, [DEFAULT_MODEL_ASSET] otherwise. Pass `ggml-base-q8_0.bin`
+     * or `ggml-tiny-q8_0.bin` for devices that need a smaller download or
      * faster-than-real-time transcription.
      */
-    private val modelAsset: String = DEFAULT_MODEL_ASSET,
+    private val modelAsset: String? = null,
     /**
      * ggml Silero VAD model file name on the `ggml-org/whisper-vad` HF repo.
      * Downloaded alongside the main model and used as a neural speech gate to
@@ -54,12 +55,15 @@ class WhisperTranscriber(
      * "continue" them. Empty disables biasing.
      */
     private val glossary: String = "",
+    /**
+     * Try the GPU (ggml's OpenCL backend) before the CPU. Without a usable
+     * OpenCL device, or after the GPU path crashed the process once, the CPU
+     * is used and [accelerationReport] says why.
+     */
+    private val preferGpu: Boolean = true,
 ) : SublyAsr, AccelerationAware {
 
-    /**
-     * whisper.cpp is built CPU-only (NEON + fp16); `use_gpu` is off in the
-     * JNI layer. Reported so callers can see that rather than assume.
-     */
+    /** Which delegate whisper.cpp ended up on, and every attempt on the way. */
     @Volatile
     override var accelerationReport: AccelerationReport? = null
         private set
@@ -90,11 +94,23 @@ class WhisperTranscriber(
             return@flow
         }
 
+        // Delegate decision comes first because it picks the model: the
+        // OpenCL backend has Adreno-tuned kernels for q8_0 matmuls but none
+        // for q5_1, so a q5_1 model on the GPU would run its matmuls on the
+        // CPU anyway.
+        val gpuDevice = if (preferGpu) runCatching { backend.gpuDevice() }.getOrDefault("") else ""
+        val gpuMarker = File(context.filesDir, GPU_CRASH_MARKER)
+        val gpuCrashedAgoMs = gpuMarker.takeIf { it.exists() }
+            ?.let { System.currentTimeMillis() - it.lastModified() }
+            ?.takeIf { it < GPU_CRASH_MARKER_TTL_MS }
+        val tryGpu = gpuDevice.isNotEmpty() && gpuCrashedAgoMs == null
+        val asset = modelAsset ?: if (tryGpu) GPU_MODEL_ASSET else DEFAULT_MODEL_ASSET
+
         val modelPath = runCatching {
             // Speech model download/extraction phase: 0.0 -> 0.85 (progress is
             // normalized to 0..1 per the ModelPrepState contract — previously
             // this emitted 0..90 and broke any progress bar built on it).
-            ensureFileDownloaded(modelAsset, modelUrl(modelAsset)) { progress ->
+            ensureFileDownloaded(asset, modelUrl(asset)) { progress ->
                 emit(ModelPrepState.Preparing(progress * 0.85f))
             }
         }.getOrElse {
@@ -119,23 +135,55 @@ class WhisperTranscriber(
             }
         }
 
-        // Native init phase: 0.9 -> 1.0
+        // Native init phase: 0.9 -> 1.0. Init includes a warm-up inference,
+        // so a GPU that initialises but cannot run whisper's graph fails here.
         emit(ModelPrepState.Preparing(0.9f))
-        val initStartNanos = System.nanoTime()
-        val created = backend.init(modelPath, targetLangRef.get(), vadPath, glossary.trim())
-        val initMs = (System.nanoTime() - initStartNanos) / 1_000_000
-        BenchLog.metric("model_init ms=$initMs model=$modelAsset ok=${created != 0L}")
+        val attempts = ArrayList<BackendAttempt>()
+        var created = 0L
+        if (tryGpu) {
+            gpuMarker.parentFile?.mkdirs()
+            runCatching { gpuMarker.writeText(gpuDevice) }
+            val start = System.nanoTime()
+            created = backend.init(modelPath, targetLangRef.get(), vadPath, glossary.trim(), useGpu = true)
+            gpuMarker.delete()
+            attempts += BackendAttempt(
+                DelegateType.GPU,
+                succeeded = created != 0L,
+                initMs = (System.nanoTime() - start) / 1_000_000,
+                failure = if (created == 0L) "whisper_init on $gpuDevice returned null" else null,
+            )
+        } else if (preferGpu) {
+            attempts += BackendAttempt(
+                DelegateType.GPU,
+                succeeded = false,
+                initMs = 0,
+                failure = if (gpuCrashedAgoMs != null) {
+                    "skipped: the process died during GPU init ${gpuCrashedAgoMs / 60_000} min ago"
+                } else {
+                    "no OpenCL GPU device (libOpenCL.so missing or not exposed to apps)"
+                },
+            )
+        }
+        if (created == 0L) {
+            val start = System.nanoTime()
+            created = backend.init(modelPath, targetLangRef.get(), vadPath, glossary.trim(), useGpu = false)
+            attempts += BackendAttempt(
+                DelegateType.CPU,
+                succeeded = created != 0L,
+                initMs = (System.nanoTime() - start) / 1_000_000,
+                failure = if (created == 0L) "whisper_init returned null" else null,
+            )
+        }
+        val active = attempts.lastOrNull { it.succeeded }?.delegate ?: DelegateType.CPU
+        BenchLog.metric(
+            "model_init model=$asset delegate=$active " +
+                attempts.joinToString(" ") { "${it.delegate}=${if (it.succeeded) "ok" else "fail"}:${it.initMs}ms" }
+        )
+        Log.i(TAG, "whisper on $active ($asset); gpu device: '${gpuDevice.ifEmpty { "none" }}'")
         accelerationReport = AccelerationReport(
-            component = "asr:whisper:$modelAsset",
-            active = DelegateType.CPU,
-            attempts = listOf(
-                BackendAttempt(
-                    DelegateType.CPU,
-                    succeeded = created != 0L,
-                    initMs = initMs,
-                    failure = if (created == 0L) "whisper_init returned null" else null,
-                )
-            ),
+            component = "asr:whisper:$asset",
+            active = active,
+            attempts = attempts,
         )
 
         if (created == 0L) {
@@ -364,6 +412,19 @@ class WhisperTranscriber(
          * `ggml-tiny-q8_0.bin` or `ggml-base-q8_0.bin` explicitly.
          */
         const val DEFAULT_MODEL_ASSET = "ggml-small-q5_1.bin"
+
+        /**
+         * The same `small` model at q8_0 for the GPU path: ggml's OpenCL
+         * backend has Adreno-optimised q8_0 matmul kernels and none for q5_1.
+         * ~264 MB, larger than q5_1, and slightly more accurate.
+         */
+        const val GPU_MODEL_ASSET = "ggml-small-q8_0.bin"
+
+        /** Survives a native crash during GPU init; see prepareModel. */
+        private const val GPU_CRASH_MARKER = "whisper/init-guard/GPU.init"
+
+        /** A GPU path that crashed the process is retried after a day. */
+        private const val GPU_CRASH_MARKER_TTL_MS = 24L * 60 * 60 * 1000
         /** ggml Silero VAD model (~885 KB) on the `ggml-org/whisper-vad` repo. */
         const val DEFAULT_VAD_ASSET = "ggml-silero-v5.1.2.bin"
         private const val WHISPER_SAMPLE_RATE = 16_000

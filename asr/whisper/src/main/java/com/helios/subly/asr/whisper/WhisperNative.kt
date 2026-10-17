@@ -39,7 +39,14 @@ internal object WhisperNative {
         targetLanguageCode: String,
         vadModelPath: String,
         glossary: String,
+        useGpu: Boolean,
     ): Long
+
+    /**
+     * The GPU device ggml registered (OpenCL), as "name: description", or
+     * empty when there is none. Safe to call before any context exists.
+     */
+    external fun nativeGpuDevice(): String
 
     /**
      * Runs full inference over one PCM window; returns concatenated text.
