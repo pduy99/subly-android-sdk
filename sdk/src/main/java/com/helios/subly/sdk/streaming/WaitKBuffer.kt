@@ -49,6 +49,7 @@ class WaitKBuffer(private val policy: WaitKPolicy) {
         val units = tokenize(hypothesis)
         val stableCount = agreedPrefixLength(previousUnits, units)
         previousUnits = units
+        if (!policy.drafts) return null
 
         // A revision that rewrites text already committed cannot be taken
         // back: the translation is on screen. Committed text stays, and the
@@ -239,6 +240,9 @@ enum class WordOrder { SVO, SOV }
  * @property phraseMarkers whole units (normalized) that close a noun phrase,
  *   such as Japanese case particles. Committing there gives the reader a
  *   draft before the verb arrives; [restructureOnFinal] then fixes the order.
+ * @property drafts whether to commit pieces before the final at all. Off,
+ *   every sentence is translated in one generation once it is final (still
+ *   off the recogniser's coroutine, still streamed token by token).
  */
 data class WaitKPolicy(
     val order: WordOrder,
@@ -246,6 +250,7 @@ data class WaitKPolicy(
     val maxWaitUnits: Int,
     val verbFinalMarkers: List<String> = emptyList(),
     val phraseMarkers: Set<String> = emptySet(),
+    val drafts: Boolean = true,
 ) {
     /**
      * Whether a sentence's final translation must be generated whole rather

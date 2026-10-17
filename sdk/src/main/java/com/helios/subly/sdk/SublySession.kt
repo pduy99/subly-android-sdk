@@ -79,6 +79,7 @@ class SublySession internal constructor(
     private val asrEngine: SublyAsr,
     private val translationEngine: SublyTranslator,
     restorePunctuation: Boolean = true,
+    private val translationDrafts: Boolean = false,
 ) : AutoCloseable {
 
     /** Null when disabled — ASR text then reaches the extractor untouched. */
@@ -363,7 +364,7 @@ class SublySession internal constructor(
             val stage = incrementalTranslator()?.let { translator ->
                 StreamingTranslationStage(
                     translator = translator,
-                    policy = WaitKPolicy.forLanguage(config.source),
+                    policy = WaitKPolicy.forLanguage(config.source).copy(drafts = translationDrafts),
                     onState = { state ->
                         _translationState.value = state
                         when (state) {
@@ -534,6 +535,7 @@ class SublySession internal constructor(
             StageMetric.Kind.PIECE -> "translate_piece"
             StageMetric.Kind.FINAL -> "translate_final_latency"
             StageMetric.Kind.FORCED_COMMIT -> "waitk_forced_commit"
+            StageMetric.Kind.FINAL_TTFT -> "translate_final_ttft"
         }
         BenchLog.metric("$name ms=${metric.ms} src_len=${metric.sourceChars}")
         _stageMetrics.tryEmit(metric)

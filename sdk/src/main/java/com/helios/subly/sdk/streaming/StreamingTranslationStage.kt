@@ -50,6 +50,13 @@ data class StageMetric(val kind: Kind, val ms: Long, val sourceChars: Int) {
          * no clause boundary. [StageMetric.ms] is 0; the count is the signal.
          */
         FORCED_COMMIT,
+
+        /**
+         * ASR final -> first token of that sentence's final translation, or
+         * to its publication when no generation was left to do. What the
+         * reader waits for after the speaker stops.
+         */
+        FINAL_TTFT,
     }
 }
 
@@ -253,6 +260,13 @@ class StreamingTranslationStage(
         pendingTtftStart = null
         try {
             val delta = final.delta
+            var finalTtftReported = false
+            val reportFinalTtft = {
+                if (!finalTtftReported) {
+                    finalTtftReported = true
+                    onMetric(StageMetric(StageMetric.Kind.FINAL_TTFT, elapsedMs(final.enqueuedAt), final.sentence.length))
+                }
+            }
             val hadPieces = segment != null || workerTranslation.isNotEmpty()
             if (delta is FinalDelta.Diverged || pieceFailed || policy.restructureOnFinal && hadPieces) {
                 // The recogniser rewrote committed text, the segment was
@@ -262,10 +276,11 @@ class StreamingTranslationStage(
                 segment?.close()
                 segment = null
                 workerTranslation = ""
-                appendStreaming(final.sentence, final.sentence, final.sentenceId, ttftStart)
+                appendStreaming(final.sentence, final.sentence, final.sentenceId, ttftStart, reportFinalTtft)
             } else if (delta is FinalDelta.Continue && delta.delta.isNotBlank()) {
-                appendStreaming(delta.delta, final.sentence, final.sentenceId, ttftStart)
+                appendStreaming(delta.delta, final.sentence, final.sentenceId, ttftStart, reportFinalTtft)
             }
+            reportFinalTtft()
             val text = segment?.translation ?: workerTranslation
             onMetric(StageMetric(StageMetric.Kind.FINAL, elapsedMs(final.enqueuedAt), final.sentence.length))
             publish(TranslationState.Finalized(final.sentence, text))
@@ -295,7 +310,13 @@ class StreamingTranslationStage(
         }
     }
 
-    private suspend fun appendStreaming(delta: String, source: String, sentenceId: Long, startedAt: Long) {
+    private suspend fun appendStreaming(
+        delta: String,
+        source: String,
+        sentenceId: Long,
+        startedAt: Long,
+        onFirstToken: () -> Unit = {},
+    ) {
         val seg = segment ?: translator.openSegment().also { segment = it }
         val settled = seg.translation
         var firstToken = true
@@ -303,6 +324,7 @@ class StreamingTranslationStage(
             if (firstToken) {
                 firstToken = false
                 onMetric(StageMetric(StageMetric.Kind.TTFT, elapsedMs(startedAt), delta.length))
+                onFirstToken()
             }
             val text = join(settled, pieceSoFar)
             synchronized(lock) { workerTranslation = text }

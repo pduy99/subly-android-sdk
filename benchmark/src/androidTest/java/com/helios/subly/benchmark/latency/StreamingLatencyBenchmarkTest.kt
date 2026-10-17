@@ -23,7 +23,10 @@ import com.helios.subly.core.model.EngineState
 import com.helios.subly.core.model.LanguageConfig
 import com.helios.subly.sdk.Subly
 import com.helios.subly.sdk.streaming.StageMetric
+import com.helios.subly.core.model.ModelPrepState
+import com.helios.subly.translator.api.SublyTranslator
 import com.helios.subly.translator.litertlm.LiteRtLmTranslator
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -72,8 +75,11 @@ import java.util.concurrent.CopyOnWriteArrayList
  * com.helios.subly.benchmark.latency.StreamingLatencyBenchmarkTest
  * ```
  * Optional runner arguments: `latencyAsr` (`vosk`, default, or `whisper`),
- * `latencyClips` (comma-separated clip ids) and `latencyWhisperGpu`
- * (`false` keeps whisper on the CPU).
+ * `latencyClips` (comma-separated clip ids), `latencyWhisperGpu`
+ * (`false` keeps whisper on the CPU) and `latencyMode=baseline`, which hides
+ * the translator's incremental interface so the session translates finals
+ * inline, one call per sentence: the pipeline as it was before streaming
+ * translation, measured on the same device, models and clips.
  */
 class StreamingLatencyBenchmarkTest {
 
@@ -106,6 +112,8 @@ class StreamingLatencyBenchmarkTest {
             "final_latency_ms" to LatencyDistribution.of(results.flatMap { it.finalLatencyMs }),
             "speech_end_to_translation_ms" to
                 LatencyDistribution.of(results.flatMap { it.speechEndToTranslationMs }),
+            "speech_end_to_first_token_ms" to
+                LatencyDistribution.of(results.flatMap { it.speechEndToFirstTokenMs }),
             "speech_onset_to_first_translation_ms" to
                 LatencyDistribution.of(results.flatMap { it.speechOnsetToFirstTranslationMs }),
         )
@@ -115,7 +123,11 @@ class StreamingLatencyBenchmarkTest {
             soc = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else "unknown",
             sdkInt = Build.VERSION.SDK_INT,
             gitSha = args.getString("benchmarkGitSha") ?: "unknown",
-            asrEngine = asrName,
+            asrEngine = when {
+                args.getString("latencyMode") == "baseline" -> "$asrName, baseline (inline finals)"
+                args.getString("latencyDrafts") == "false" -> "$asrName, streaming, no drafts"
+                else -> "$asrName, streaming, drafts"
+            },
             delegates = delegates.values.map { it.toRecord() },
             targets = targets,
             summary = summary,
@@ -123,6 +135,8 @@ class StreamingLatencyBenchmarkTest {
                 "ttft_p90" to summary["ttft_ms"]?.let { it.p90 <= targets.ttftMs },
                 "speech_end_to_translation_p90" to
                     summary["speech_end_to_translation_ms"]?.let { it.p90 <= targets.speechEndToTranslationMs },
+                "speech_end_to_first_token_p90" to
+                    summary["speech_end_to_first_token_ms"]?.let { it.p90 <= targets.speechEndToTranslationMs },
             ),
             memory = memoryRecord,
             clips = results,
@@ -156,14 +170,21 @@ class StreamingLatencyBenchmarkTest {
             clipId = requireNotNull(clip.id), language = source, target = target,
             durationSec = clip.durationSec, finals = 0, forcedCommits = 0,
             ttftMs = emptyList(), pieceMs = emptyList(), finalLatencyMs = emptyList(),
-            speechEndToTranslationMs = emptyList(), speechOnsetToFirstTranslationMs = emptyList(),
+            speechEndToTranslationMs = emptyList(), speechEndToFirstTokenMs = emptyList(),
+            speechOnsetToFirstTranslationMs = emptyList(),
             error = reason,
         )
 
+        val baseline = args.getString("latencyMode") == "baseline"
+        val timedCalls = CopyOnWriteArrayList<Pair<Long, Long>>()
         val subly = Subly.Builder()
             .setAsrEngine { asrFactory(asrName) }
-            .setTranslator { LiteRtLmTranslator(context) }
+            .setTranslator {
+                val translator = LiteRtLmTranslator(context)
+                if (baseline) FinalsOnlyTimer(translator, timedCalls) else translator
+            }
             .setAudioCapture { TrackedCapture(capture, tracker) }
+            .setTranslationDrafts(args.getString("latencyDrafts") != "false")
             .build()
 
         return try {
@@ -181,7 +202,11 @@ class StreamingLatencyBenchmarkTest {
                     session.captions.collect { caption ->
                         val now = System.nanoTime()
                         lastActivityAt = SystemClock.elapsedRealtime()
-                        if (!sentenceHasTranslation && caption.translatedText.isNotBlank()) {
+                        // A finals-only session fills a partial's translation
+                        // with its source text; that is not a translation.
+                        val translated = caption.translatedText.isNotBlank() &&
+                            (caption.isFinal || caption.translatedText != caption.originalText)
+                        if (!sentenceHasTranslation && translated) {
                             firstTranslationAt += now
                             sentenceHasTranslation = true
                         }
@@ -220,7 +245,16 @@ class StreamingLatencyBenchmarkTest {
                 // up), not that it was fast: fail rather than report nothing.
                 if (finalsAt.isEmpty()) return failed("no captions produced")
 
-                val finalLatencies = metrics.filter { it.kind == StageMetric.Kind.FINAL }.map { it.ms }
+                // Baseline: no stage metrics. Each final was translated inline
+                // in one call that started at its ASR final, so the timed
+                // calls give the same quantities. The warm-up call during
+                // prepare is not a caption and is dropped.
+                val captionCalls = if (baseline) timedCalls.drop(1) else emptyList()
+                val finalLatencies = if (baseline) {
+                    captionCalls.map { (start, end) -> (end - start) / 1_000_000 }
+                } else {
+                    metrics.filter { it.kind == StageMetric.Kind.FINAL }.map { it.ms }
+                }
                 // Pair each published final with its ASR-final time (published
                 // time minus the stage's final latency), then look back to the
                 // last voiced frame before it.
@@ -228,6 +262,18 @@ class StreamingLatencyBenchmarkTest {
                     val asrFinalAt = publishedAt - latencyMs * 1_000_000
                     tracker.lastVoicedAtOrBefore(asrFinalAt)?.let { (publishedAt - it) / 1_000_000 }
                 }
+                // First token of each final, against the same speech end.
+                // Baseline shows nothing until the whole translation is done.
+                val finalTtfts = if (baseline) finalLatencies else
+                    metrics.filter { it.kind == StageMetric.Kind.FINAL_TTFT }.map { it.ms }
+                val speechEndToFirstToken = finalsAt.zip(finalLatencies).zip(finalTtfts)
+                    .mapNotNull { (pair, firstTokenMs) ->
+                        val (publishedAt, latencyMs) = pair
+                        val asrFinalAt = publishedAt - latencyMs * 1_000_000
+                        tracker.lastVoicedAtOrBefore(asrFinalAt)?.let {
+                            (asrFinalAt + firstTokenMs * 1_000_000 - it) / 1_000_000
+                        }
+                    }
                 val onsets = buildList {
                     var previousFinal = 0L
                     for ((i, first) in firstTranslationAt.withIndex()) {
@@ -244,10 +290,13 @@ class StreamingLatencyBenchmarkTest {
                     durationSec = clip.durationSec,
                     finals = finalsAt.size,
                     forcedCommits = metrics.count { it.kind == StageMetric.Kind.FORCED_COMMIT },
-                    ttftMs = metrics.filter { it.kind == StageMetric.Kind.TTFT }.map { it.ms },
+                    // Baseline shows nothing until the whole translation is
+                    // done, so its first token is its last.
+                    ttftMs = if (baseline) finalLatencies else metrics.filter { it.kind == StageMetric.Kind.TTFT }.map { it.ms },
                     pieceMs = metrics.filter { it.kind == StageMetric.Kind.PIECE }.map { it.ms },
                     finalLatencyMs = finalLatencies,
                     speechEndToTranslationMs = speechEnd,
+                    speechEndToFirstTokenMs = speechEndToFirstToken,
                     speechOnsetToFirstTranslationMs = onsets,
                 )
             }
@@ -305,4 +354,28 @@ class StreamingLatencyBenchmarkTest {
         /** No caption for this long after playback means the pipeline is done. */
         const val QUIESCENCE_MS = 12_000L
     }
+}
+
+/**
+ * Presents a translator as a plain [SublyTranslator] (no incremental
+ * interface, finals only) and records each translate call's wall-clock span.
+ */
+private class FinalsOnlyTimer(
+    private val inner: LiteRtLmTranslator,
+    private val calls: MutableList<Pair<Long, Long>>,
+) : SublyTranslator {
+    override val translatesPartials = false
+
+    override suspend fun translate(text: String): String {
+        val start = System.nanoTime()
+        return try {
+            inner.translate(text)
+        } finally {
+            calls += start to System.nanoTime()
+        }
+    }
+
+    override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = inner.prepareModel(config)
+    override fun release() = inner.release()
+    override fun supportedLanguages(): List<String> = inner.supportedLanguages()
 }

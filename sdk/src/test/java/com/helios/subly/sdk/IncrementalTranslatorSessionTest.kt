@@ -94,7 +94,7 @@ class IncrementalTranslatorSessionTest {
     }
 
     @Test
-    fun `clauses are translated incrementally and ASR is never held up`() {
+    fun `by default a sentence is translated once, when final, off the ASR coroutine`() {
         val asr = FakeAsr()
         val translator = SlowIncrementalTranslator(generationMs = 1_000)
         val session = SublySession(
@@ -103,6 +103,40 @@ class IncrementalTranslatorSessionTest {
             asrEngine = asr,
             translationEngine = translator,
             restorePunctuation = false,
+        )
+
+        val captions = runBlocking {
+            val captions = CopyOnWriteArrayList<Caption>()
+            val sawFinal = CompletableDeferred<Unit>()
+            val collector = launch(Dispatchers.Default) {
+                session.captions.collect {
+                    captions += it
+                    if (it.isFinal) sawFinal.complete(Unit)
+                }
+            }
+            delay(100)
+            session.start()
+            withTimeout(10_000) { sawFinal.await() }
+            collector.cancel()
+            session.close()
+            captions.toList()
+        }
+
+        assertEquals(listOf("the man who lives next door."), translator.appends)
+        assertEquals("THE MAN WHO LIVES NEXT DOOR.", captions.last { it.isFinal }.translatedText)
+    }
+
+    @Test
+    fun `with drafts, clauses are translated incrementally and ASR is never held up`() {
+        val asr = FakeAsr()
+        val translator = SlowIncrementalTranslator(generationMs = 1_000)
+        val session = SublySession(
+            config = LanguageConfig(source = "en", target = "fr"),
+            audioCapture = FakeCapture(),
+            asrEngine = asr,
+            translationEngine = translator,
+            restorePunctuation = false,
+            translationDrafts = true,
         )
 
         val captions = runBlocking {

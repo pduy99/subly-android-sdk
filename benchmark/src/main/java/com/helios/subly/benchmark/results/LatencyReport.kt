@@ -72,6 +72,7 @@ data class ClipLatency(
     val pieceMs: List<Long>,
     val finalLatencyMs: List<Long>,
     val speechEndToTranslationMs: List<Long>,
+    val speechEndToFirstTokenMs: List<Long>,
     val speechOnsetToFirstTranslationMs: List<Long>,
     val error: String? = null,
 )
