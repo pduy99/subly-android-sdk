@@ -3,6 +3,7 @@ package com.helios.subly.asr.sherpa
 import android.content.Context
 import android.util.Log
 import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.asr.vad.SpeechGate
 import com.helios.subly.core.downloader.ModelDownloader
 import com.helios.subly.core.downloader.OkHttpModelDownloader
 import com.helios.subly.core.model.AsrResult
@@ -20,9 +21,11 @@ import java.util.concurrent.atomic.AtomicReference
 
 class SherpaOnnxTranscriber internal constructor(
     private val context: Context,
-    private val model: SherpaOnnxModel,
+    /** A fixed model, or null to pick one per source language at prepare. */
+    private val pinnedModel: SherpaOnnxModel?,
     private val backend: SherpaOnnxBackend,
     private val modelLoaderFactory: SherpaOnnxModelLoaderFactory,
+    private val speechGate: SpeechGate?,
 ) : SublyAsr {
 
     /**
@@ -30,16 +33,24 @@ class SherpaOnnxTranscriber internal constructor(
      *   prepare. Defaults to a plain [OkHttpModelDownloader]; supply your own
      *   (e.g. an OkHttp client with auth headers or certificate pinning, often
      *   provided via Hilt) to control how models are fetched.
+     * @param speechGate Silero gate that replaces non-speech audio with
+     *   silence before it reaches the recogniser, so music and room noise
+     *   stop being decoded into confident nonsense. Pass `null` to feed the
+     *   recogniser raw audio. The gate provisions itself during
+     *   [prepareModel] and degrades to a pass-through if it cannot — it
+     *   never fails preparation.
      */
     @JvmOverloads
     constructor(
         context: Context,
         modelDownloader: ModelDownloader = OkHttpModelDownloader(),
+        speechGate: SpeechGate? = SpeechGate(context, modelDownloader),
     ) : this(
         context = context,
-        model = SherpaOnnxModel.Default,
+        pinnedModel = null,
         backend = SherpaOnnxBackend.Jni,
         modelLoaderFactory = SherpaOnnxModelLoaderFactory.of(modelDownloader),
+        speechGate = speechGate,
     )
 
     /**
@@ -52,6 +63,13 @@ class SherpaOnnxTranscriber internal constructor(
 
     /** Lazily-initialized recognizer/stream pair. Cleared on [release]. */
     private val handleRef = AtomicReference<SherpaOnnxBackend.Handle?>(null)
+
+    /** Restores 。，？ in Chinese finals; neither Mandarin model punctuates. */
+    private val punctuator = ChinesePunctuator(context, modelLoaderFactory)
+
+    /** The model [handleRef] was built from; models are per language. */
+    @Volatile
+    private var model: SherpaOnnxModel = pinnedModel ?: SherpaOnnxModel.Default
 
     /**
      * Serializes backend calls. Necessary because sherpa-onnx mutates the
@@ -94,7 +112,16 @@ class SherpaOnnxTranscriber internal constructor(
 
         return frames
             .transform { frame ->
-                val pcm = toMonoFloatPcm(frame, model.sampleRateHz)
+                val mono = toMonoFloatPcm(frame, model.sampleRateHz)
+                if (mono.isEmpty()) return@transform
+                // Non-speech is muted rather than dropped: the endpoint rules
+                // in CaptionEndpointTuning decide where a caption ends by
+                // counting trailing silence, so removing the audio outright
+                // would stop them ever firing. The gate also holds a short
+                // lookahead back, so it returns less than it was given until
+                // its delay line fills — an empty return is normal, not a
+                // silent frame.
+                val pcm = speechGate?.process(mono) ?: mono
                 if (pcm.isEmpty()) return@transform
 
                 if (utteranceStartMs < 0) utteranceStartMs = frame.timestampMs
@@ -126,7 +153,7 @@ class SherpaOnnxTranscriber internal constructor(
                         // finals go out unpunctuated and flow immediately.
                         // NOTE: never log transcript content — it is end-user speech.
                         Log.d(TAG, "Emitted final packet (length=${text.length})")
-                        emit(AsrResult.Final(text))
+                        emit(AsrResult.Final(punctuate(text)))
                         // The next caption opens a sentence only if this one
                         // closed one. This engine emits no terminators, so in
                         // practice that is false — but it stays correct if a
@@ -151,16 +178,39 @@ class SherpaOnnxTranscriber internal constructor(
                     lastEmittedText = text
                     lastPartialEmitMs = now
                     Log.d(TAG, "Emitted partial packet (length=${text.length})")
-                    emit(AsrResult.Partial(text))
+                    // Punctuated so the session can settle the sentences
+                    // already closed inside a long run (and translate them
+                    // once) instead of retranslating the whole run.
+                    emit(AsrResult.Partial(punctuatePartial(text)))
                 }
             }
             .onCompletion { cause ->
                 // Only on a clean end of audio. On cancellation the collector
                 // is going away and a late caption would arrive after the
                 // caller believed the session was over.
+                if (cause == null) {
+                    // The gate holds a lookahead window back so it can see an
+                    // onset coming. At end of audio there is no "later" left
+                    // to inform it, so drain the delay line into the
+                    // recogniser before deciding what the tail says —
+                    // otherwise the last ~128 ms of speech is never decoded.
+                    val tail = speechGate?.flushFloat() ?: FloatArray(0)
+                    if (tail.isNotEmpty()) {
+                        val decoded = synchronized(nativeLock) {
+                            handleRef.get()?.let { h ->
+                                backend.acceptWaveform(h, tail, model.sampleRateHz)
+                                backend.decode(h)
+                            }
+                        }
+                        val text = decoded?.text?.trim().orEmpty()
+                        if (text.isNotEmpty()) {
+                            pendingText = CasingNormalizer.normalise(text, atSentenceStart)
+                        }
+                    }
+                }
                 if (cause == null && pendingText.isNotEmpty()) {
                     Log.d(TAG, "Flushed tail packet (length=${pendingText.length})")
-                    emit(AsrResult.Final(pendingText))
+                    emit(AsrResult.Final(punctuate(pendingText)))
                     pendingText = ""
                 }
             }
@@ -188,16 +238,37 @@ class SherpaOnnxTranscriber internal constructor(
             return@flow
         }
 
-        if (handleRef.get() != null) {
-            emit(ModelPrepState.Ready)
+        val wanted = pinnedModel ?: SherpaOnnxModel.forLanguage(config.source)
+        if (wanted == null) {
+            emit(
+                ModelPrepState.Error(
+                    IllegalArgumentException(
+                        "No sherpa-onnx model for source language '${config.source}'. " +
+                            "Supported: ${supportedLanguages()}."
+                    )
+                )
+            )
             return@flow
         }
 
+        // Same model already loaded: ready. Another language's model loaded
+        // (the session switched languages): free it before loading this one.
+        if (handleRef.get() != null) {
+            if (wanted == model) {
+                emit(ModelPrepState.Ready)
+                return@flow
+            }
+            synchronized(nativeLock) {
+                handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+            }
+        }
+        model = wanted
+
         val loader = modelLoaderFactory.create(context)
 
-        // ASR provisioning (on-disk / bundled assets / download): 0% -> 90%
+        // ASR provisioning (on-disk / bundled assets / download): 0% -> 85%
         loader.provisionWithProgress(model)
-            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.9f)) }
+            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.85f)) }
             .collect {}
 
         // A finished-but-not-ready provision means no source was available.
@@ -216,10 +287,22 @@ class SherpaOnnxTranscriber internal constructor(
         }
 
         val modelDir = loader.downloadTarget(model).absolutePath
+
+        // Speech gate (~0.6 MB checkpoint): 85% -> 95%. Deliberately not
+        // guarded by a readiness check — the gate reports success either way
+        // and simply runs as a pass-through when it could not be built, so a
+        // missing VAD costs accuracy, never a failed session.
+        speechGate?.prepare()
+            ?.onEach { p -> emit(ModelPrepState.Preparing(0.85f + p * 0.05f)) }
+            ?.collect {}
+        // Chinese punctuation (~75 MB, first run only): 90% -> 95%.
+        if ("zh" in model.languages) {
+            punctuator.prepare().collect { p -> emit(ModelPrepState.Preparing(0.90f + p * 0.05f)) }
+        }
         emit(ModelPrepState.Preparing(0.95f))
 
         // ASR native init.
-        val created = backend.init(modelDir, model.sampleRateHz)
+        val created = backend.init(modelDir, model.sampleRateHz, model.numThreads)
         if (created == null) {
             emit(
                 ModelPrepState.Error(
@@ -239,10 +322,13 @@ class SherpaOnnxTranscriber internal constructor(
     override fun release() {
         synchronized(nativeLock) {
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+            speechGate?.release()
+            punctuator.release()
         }
     }
 
-    override fun supportedLanguages(): List<String> = listOf("en")
+    override fun supportedLanguages(): List<String> =
+        pinnedModel?.languages?.toList() ?: SherpaOnnxModel.supportedLanguages
 
     /**
      * Convert an int16 stereo/mono [AudioFrame] to the mono float PCM the
@@ -330,4 +416,10 @@ class SherpaOnnxTranscriber internal constructor(
         /** Terminators across the scripts this SDK captions, incl. full-width. */
         val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '。', '！', '？')
     }
+
+    private fun punctuate(text: String): String =
+        if ("zh" in model.languages) punctuator.punctuate(text) else text
+
+    private fun punctuatePartial(text: String): String =
+        if ("zh" in model.languages) punctuator.punctuatePartial(text) else text
 }

@@ -20,6 +20,17 @@ okhttp = "4.12.0"
 gson = "2.11.0"
 anthropic = "2.34.0"
 vosk = "0.3.75"
+# Pinned deliberately: "latest.release" makes the build non-reproducible, and
+# this API is still pre-1.0 and moves between minors.
+#
+# 0.16.1 rather than the newest (0.17.0): 0.17.0 is built against Kotlin 2.4,
+# whose class metadata the Kotlin compiler AGP 9.2 embeds (2.2.x) cannot read —
+# it fails compilation outright, not just with a warning. 0.16.1 is the last
+# release on Kotlin 2.2.x. Its API surface is identical to 0.17.0 for
+# everything this module uses (Engine/EngineConfig, ConversationConfig with
+# maxOutputToken, SamplerConfig, Contents/Content.Text), so nothing here is
+# waiting on the bump. Revisit when the project moves to Kotlin 2.4.
+litertlm = "0.16.1"
 coreKtx = "1.10.1"
 annotation = "1.9.1"
 appcompat = "1.6.1"
@@ -42,7 +53,7 @@ mockito-kotlin = { group = "org.mockito.kotlin", name = "mockito-kotlin", versio
 mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
 mlkit-translate = { group = "com.google.mlkit", name = "translate", version.ref = "mlkitTranslate" }
 mlkit-language-id = { group = "com.google.mlkit", name = "language-id", version.ref = "mlkitLanguageId" }
-litert-lm = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version = "latest.release" }
+litert-lm = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 anthropic-java = { group = "com.anthropic", name = "anthropic-java", version.ref = "anthropic" }

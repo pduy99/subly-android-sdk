@@ -13,6 +13,14 @@ data class BenchmarkResults(
     val device: DeviceInfo,
     /** SDK repo commit the run measured (injected by Gradle). */
     val sdkGitSha: String,
+    /**
+     * Which translator produced every translation in this run — the matrix
+     * has an engine axis but only ever one translator, and comparing two runs
+     * is meaningless without knowing whether that changed. Nullable because
+     * results.json files written before the field existed have no value for
+     * it; treat null as "mlkit".
+     */
+    val translator: String? = null,
     val entries: List<Entry>,
 ) {
     data class DeviceInfo(val model: String, val sdk: Int)

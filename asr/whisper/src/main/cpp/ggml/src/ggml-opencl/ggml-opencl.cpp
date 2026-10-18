@@ -4832,7 +4832,15 @@ inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backen
 
     size_t elem_num = tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
 
-    return ((elem_num < 128 * 1024 * 1024) && adreno_kernel);  // max element num: 2**27
+    // SUBLY PATCH: the transposed layout requires ne00 % 32 == 0 and
+    // ne01 % 4 == 0 and set_tensor asserts both. LLM vocabularies satisfy
+    // them; whisper's token embedding (51865 rows) does not, and aborted the
+    // model load. Every caller (set/get tensor, mul_mat dispatch) goes
+    // through this predicate, so excluding such tensors here keeps upload
+    // and matmul consistent: they use the generic q8_0 kernels instead.
+    const bool shape_ok = tensor->ne[0] % 32 == 0 && tensor->ne[1] % 4 == 0;
+
+    return ((elem_num < 128 * 1024 * 1024) && adreno_kernel && shape_ok);  // max element num: 2**27
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -7751,16 +7759,20 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
 }
 
+// SUBLY PATCH: whisper.cpp queries alignment and max size while loading the
+// model, before any OpenCL backend exists, when dev_ctx->backend_ctx is still
+// null. ggml_cl_init() is idempotent (alloc_buffer already calls it), so
+// initialise here rather than dereference null.
 static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
-    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
-    return dev_ctx->backend_ctx->alignment;
+    ggml_backend_opencl_context * backend_ctx = ggml_cl_init(buffer_type->device);
+    return backend_ctx->alignment;
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_type_t buffer_type) {
     static size_t max_size = -1;
     if (max_size == (size_t)-1) {
-        ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
-        max_size = dev_ctx->backend_ctx->max_alloc_size;
+        // SUBLY PATCH: see get_alignment.
+        max_size = ggml_cl_init(buffer_type->device)->max_alloc_size;
     }
     return max_size;
 }

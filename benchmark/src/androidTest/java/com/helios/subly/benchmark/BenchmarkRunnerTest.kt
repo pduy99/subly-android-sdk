@@ -12,7 +12,6 @@ import com.helios.subly.core.model.EngineState
 import com.helios.subly.core.model.LanguageConfig
 import com.helios.subly.core.model.ModelPrepState
 import com.helios.subly.sdk.Subly
-import com.helios.subly.translator.mlkit.MlKitTranslator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
@@ -65,6 +64,7 @@ class BenchmarkRunnerTest {
 
         val clipFilter = filterOf("benchmarkClips")
         val engineFilter = filterOf("benchmarkEngines")
+        val translator = BenchmarkTranslator.of(args.getString("benchmarkTranslator"))
         val clips = manifest.clips.filter { clipFilter == null || it.id in clipFilter }
         val engines = EngineCatalog.engines().filter {
             engineFilter == null || it.name in engineFilter
@@ -88,6 +88,7 @@ class BenchmarkRunnerTest {
                 device = BenchmarkResults.DeviceInfo(Build.MODEL, Build.VERSION.SDK_INT),
                 sdkGitSha = InstrumentationRegistry.getArguments()
                     .getString("benchmarkGitSha") ?: "unknown",
+                translator = translator.id,
                 entries = entries.toList(),
             )
             TestStorage().openOutputFile("results.json").bufferedWriter().use {
@@ -133,12 +134,12 @@ class BenchmarkRunnerTest {
                     continue
                 }
 
-                val primary = runClip(context, clip, engine, targets.first())
+                val primary = runClip(context, clip, engine, translator, targets.first())
                 entries += primary
                 writeResults()
 
                 for (target in targets.drop(1)) {
-                    entries += retranslate(context, clip, engine, target, primary)
+                    entries += retranslate(context, clip, engine, translator, target, primary)
                     writeResults()
                 }
             }
@@ -166,6 +167,7 @@ class BenchmarkRunnerTest {
         context: Context,
         clip: DatasetManifest.Clip,
         engine: BenchmarkEngine,
+        translator: BenchmarkTranslator,
         targetLang: String,
         primary: BenchmarkResults.Entry,
     ): BenchmarkResults.Entry {
@@ -194,10 +196,10 @@ class BenchmarkRunnerTest {
         }
 
         return try {
-            val translator = MlKitTranslator()
+            val engineInstance = translator.factory(context)
             try {
                 val prepared = withTimeout(PREPARE_TIMEOUT_MS) {
-                    translator.prepareModel(
+                    engineInstance.prepareModel(
                         LanguageConfig(source = requireNotNull(clip.language), target = targetLang)
                     ).first { it is ModelPrepState.Ready || it is ModelPrepState.Error }
                 }
@@ -208,13 +210,13 @@ class BenchmarkRunnerTest {
                     primary.captions.map {
                         BenchmarkResults.CaptionPair(
                             original = it.original,
-                            translated = translator.translate(it.original).trim(),
+                            translated = engineInstance.translate(it.original).trim(),
                         )
                     },
                     null,
                 )
             } finally {
-                translator.release()
+                engineInstance.release()
             }
         } catch (e: Exception) {
             entry(emptyList(), "retranslate exception: $e")
@@ -225,6 +227,7 @@ class BenchmarkRunnerTest {
         context: Context,
         clip: DatasetManifest.Clip,
         engine: BenchmarkEngine,
+        translator: BenchmarkTranslator,
         targetLang: String,
     ): BenchmarkResults.Entry {
         val startedMs = SystemClock.elapsedRealtime()
@@ -254,7 +257,7 @@ class BenchmarkRunnerTest {
                 val capture = FileAudioCapture(audioFile)
                 val subly = Subly.Builder()
                     .setAsrEngine { engine.factory(context) }
-                    .setTranslator { MlKitTranslator() }
+                    .setTranslator { translator.factory(context) }
                     .setAudioCapture { capture }
                     .setPunctuationRestoration(engine.punctuation)
                     .build()
@@ -362,8 +365,13 @@ class BenchmarkRunnerTest {
     }
 
     private companion object {
-        /** First run downloads the Vosk model (~41 MB) and ML Kit en↔vi. */
-        const val PREPARE_TIMEOUT_MS = 10 * 60 * 1_000L
+        /**
+         * First run downloads the ASR model (~41 MB for Vosk) and the
+         * translator's. Sized for the LLM translator, whose checkpoint is
+         * ~1.6 GB and whose engine init and warm-up are both counted here —
+         * ML Kit's whole preparation fits in the first minute of it.
+         */
+        const val PREPARE_TIMEOUT_MS = 45 * 60 * 1_000L
 
         /**
          * Extra wall-clock budget beyond the clip for decode/ASR/translate

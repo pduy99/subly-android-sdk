@@ -3,6 +3,11 @@ package com.helios.subly.asr.vosk
 import android.content.Context
 import android.util.Log
 import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.core.model.AccelerationAware
+import com.helios.subly.core.model.AccelerationReport
+import com.helios.subly.core.model.BackendAttempt
+import com.helios.subly.core.model.DelegateType
+import com.helios.subly.asr.vad.SpeechGate
 import com.helios.subly.core.downloader.ModelDownloader
 import com.helios.subly.core.downloader.OkHttpModelDownloader
 import com.helios.subly.core.model.AsrResult
@@ -34,26 +39,49 @@ class VoskTranscriber internal constructor(
     private val context: Context,
     private val backend: VoskBackend,
     private val modelLoaderFactory: VoskModelLoaderFactory,
-) : SublyAsr {
+    private val speechGate: SpeechGate?,
+) : SublyAsr, AccelerationAware {
+
+    /** Kaldi/Vosk has no GPU or NPU path on Android: always CPU. */
+    @Volatile
+    override var accelerationReport: AccelerationReport? = null
+        private set
+
 
     /**
      * @param modelDownloader downloader used to fetch model zips on first
      *   prepare. Defaults to a plain [OkHttpModelDownloader]; supply your own
      *   (e.g. an OkHttp client with auth headers, certificate pinning, or a
      *   private mirror) to control how models are fetched.
+     * @param speechGate Silero gate that replaces non-speech audio with
+     *   silence before it reaches the recogniser, so music and room noise
+     *   stop being decoded into confident nonsense. Pass `null` to feed the
+     *   recogniser raw audio.
+     *
+     *   The gate runs on the sherpa-onnx runtime, which this module does not
+     *   otherwise need. An app that depends on `:asr:vosk` alone and ships no
+     *   sherpa AAR still builds and runs — the gate finds no runtime and
+     *   becomes a pass-through. Add the AAR to the app's runtime classpath
+     *   (see the README) to get the gate.
      */
     @JvmOverloads
     constructor(
         context: Context,
         modelDownloader: ModelDownloader = OkHttpModelDownloader(),
+        speechGate: SpeechGate? = SpeechGate(context, modelDownloader),
     ) : this(
         context = context,
         backend = VoskBackend.Jni,
         modelLoaderFactory = VoskModelLoaderFactory.of(modelDownloader),
+        speechGate = speechGate,
     )
 
     /** Lazily-initialized model/recognizer pair. Cleared on [release]. */
     private val handleRef = AtomicReference<VoskBackend.Handle?>(null)
+
+    /** Which language model [handleRef] holds; Vosk models are per language. */
+    @Volatile
+    private var loadedModel: VoskModels? = null
 
     /**
      * Serializes native calls. Vosk's [Recognizer] is not thread-safe;
@@ -79,7 +107,15 @@ class VoskTranscriber internal constructor(
 
         return frames
             .transform { frame ->
-                val pcm = toMono16kShorts(frame)
+                val mono = toMono16kShorts(frame)
+                if (mono.isEmpty()) return@transform
+                // Muted, not dropped: Kaldi's endpointing decides where an
+                // utterance ends by counting trailing silence, so cutting the
+                // audio out would stop finals ever being emitted. The gate
+                // also holds a short lookahead back, so it returns less than
+                // it was given until its delay line fills — an empty return is
+                // normal, not a silent frame.
+                val pcm = speechGate?.process(mono) ?: mono
                 if (pcm.isEmpty()) return@transform
 
                 val endpoint = synchronized(nativeLock) {
@@ -143,12 +179,22 @@ class VoskTranscriber internal constructor(
             return@flow
         }
 
+        val model = VoskModels.forLanguage(config.source)
+
+        // Already holding this language's model: nothing to do. Holding
+        // another language's (the session switched languages): free it before
+        // loading the new one, so two models are never resident at once.
         if (handleRef.get() != null) {
-            emit(ModelPrepState.Ready)
-            return@flow
+            if (model == loadedModel) {
+                emit(ModelPrepState.Ready)
+                return@flow
+            }
+            synchronized(nativeLock) {
+                handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+                loadedModel = null
+            }
         }
 
-        val model = VoskModels.forLanguage(config.source)
         if (model == null) {
             emit(
                 ModelPrepState.Error(
@@ -163,9 +209,9 @@ class VoskTranscriber internal constructor(
 
         val loader = modelLoaderFactory.create(context)
 
-        // Provision (download + unpack): 0% -> 90%.
+        // Provision (download + unpack): 0% -> 85%.
         loader.provisionWithProgress(model)
-            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.9f)) }
+            .onEach { p -> emit(ModelPrepState.Preparing(p * 0.85f)) }
             .collect {}
 
         // A finished-but-not-ready provision means no source was available or
@@ -183,9 +229,27 @@ class VoskTranscriber internal constructor(
             return@flow
         }
 
+        // Speech gate (~0.6 MB checkpoint): 85% -> 95%. Never fails the
+        // session — a gate that could not be built runs as a pass-through.
+        speechGate?.prepare()
+            ?.onEach { p -> emit(ModelPrepState.Preparing(0.85f + p * 0.10f)) }
+            ?.collect {}
         emit(ModelPrepState.Preparing(0.95f))
 
+        val initStart = System.nanoTime()
         val created = backend.init(loader.modelDir(model).absolutePath, VOSK_SAMPLE_RATE_HZ)
+        accelerationReport = AccelerationReport(
+            component = "asr:vosk:${model.dirName}",
+            active = DelegateType.CPU,
+            attempts = listOf(
+                BackendAttempt(
+                    DelegateType.CPU,
+                    succeeded = created != null,
+                    initMs = (System.nanoTime() - initStart) / 1_000_000,
+                    failure = if (created == null) "Vosk native init failed" else null,
+                )
+            ),
+        )
         if (created == null) {
             emit(
                 ModelPrepState.Error(
@@ -196,7 +260,9 @@ class VoskTranscriber internal constructor(
         }
 
         // If a concurrent prepare won the race, release ours and keep theirs.
-        if (!handleRef.compareAndSet(null, created)) {
+        if (handleRef.compareAndSet(null, created)) {
+            loadedModel = model
+        } else {
             runCatching { backend.release(created) }
         }
 
@@ -206,6 +272,8 @@ class VoskTranscriber internal constructor(
     override fun release() {
         synchronized(nativeLock) {
             handleRef.getAndSet(null)?.let { runCatching { backend.release(it) } }
+            loadedModel = null
+            speechGate?.release()
         }
     }
 

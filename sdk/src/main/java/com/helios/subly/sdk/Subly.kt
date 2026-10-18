@@ -32,6 +32,7 @@ class Subly private constructor(
     private val translatorFactory: () -> SublyTranslator,
     private val audioCaptureFactory: () -> AudioCapture,
     private val restorePunctuation: Boolean,
+    private val translationDrafts: Boolean,
 ) {
 
     /**
@@ -42,11 +43,12 @@ class Subly private constructor(
      * [SublySession.close] when done.
      */
     fun createSession(config: LanguageConfig): SublySession = SublySession(
-        config = config,
+        initialConfig = config,
         audioCapture = audioCaptureFactory(),
         asrEngine = asrEngineFactory(),
         translationEngine = translatorFactory(),
         restorePunctuation = restorePunctuation,
+        translationDrafts = translationDrafts,
     )
 
     class Builder {
@@ -56,6 +58,7 @@ class Subly private constructor(
             AudioPlayback(dataSource = AudioRecordDataSource())
         }
         private var restorePunctuation: Boolean = true
+        private var translationDrafts: Boolean = false
 
         /** Required. Factory invoked once per session. */
         fun setAsrEngine(factory: () -> SublyAsr) = apply { asrEngineFactory = factory }
@@ -96,6 +99,19 @@ class Subly private constructor(
             apply { restorePunctuation = enabled }
 
         /**
+         * For incremental (LLM) translators: whether to translate settled
+         * clauses as drafts while a sentence is still being spoken, or only
+         * once it is final (default). Measured on a Galaxy S24 Ultra with
+         * Qwen3-4B on the GPU: drafts put translated text on screen ~2.8 s
+         * into a sentence instead of ~8.6 s, but the extra generations
+         * compete with the final, so after the speaker stops the translation
+         * starts at 4.2 s p50 instead of 1.75 s. See
+         * docs/streaming-translation.md.
+         */
+        fun setTranslationDrafts(enabled: Boolean) =
+            apply { translationDrafts = enabled }
+
+        /**
          * @throws IllegalArgumentException with an actionable message when a
          * required component is missing — never a bare NPE.
          */
@@ -108,6 +124,7 @@ class Subly private constructor(
             },
             audioCaptureFactory = audioCaptureFactory,
             restorePunctuation = restorePunctuation,
+            translationDrafts = translationDrafts,
         )
     }
 }

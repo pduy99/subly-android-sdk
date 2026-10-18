@@ -62,7 +62,7 @@ class MidUtteranceFinalTest {
 
     private fun captionsFor(finals: List<AsrResult.Final>): List<Caption> = runBlocking {
         val session = SublySession(
-            config = LanguageConfig(source = "en", target = "vi"),
+            initialConfig = LanguageConfig(source = "en", target = "vi"),
             audioCapture = FakeCapture(),
             asrEngine = FakeAsr(finals),
             translationEngine = EchoTranslator(),
@@ -119,7 +119,7 @@ class MidUtteranceFinalTest {
 
         val captions = runBlocking {
             val session = SublySession(
-                config = LanguageConfig(source = "en", target = "vi"),
+                initialConfig = LanguageConfig(source = "en", target = "vi"),
                 audioCapture = FakeCapture(),
                 asrEngine = slowAsr,
                 translationEngine = EchoTranslator(),

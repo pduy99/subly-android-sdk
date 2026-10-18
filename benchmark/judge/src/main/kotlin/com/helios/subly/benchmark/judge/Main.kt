@@ -84,6 +84,7 @@ fun main(args: Array<String>) {
         deviceModel = results.device.model,
         deviceSdk = results.device.sdk,
         sdkGitSha = results.sdkGitSha,
+        translator = results.translator ?: "mlkit",
         judgeModel = model,
         promptVersion = PROMPT_VERSION,
     )
