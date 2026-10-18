@@ -12,6 +12,7 @@ import com.helios.subly.asr.vosk.VoskTranscriber
 import com.helios.subly.translator.litertlm.LiteRtLmModel
 import com.helios.subly.translator.mlkit.MlKitTranslator
 import com.helios.subly.asr.sherpa.SenseVoiceTranscriber
+import com.helios.subly.asr.sherpa.SherpaAutoTranscriber
 import com.helios.subly.asr.sherpa.SherpaOnnxTranscriber
 import com.helios.subly.asr.whisper.WhisperTranscriber
 import com.helios.subly.benchmark.FileAudioCapture
@@ -341,7 +342,8 @@ class StreamingLatencyBenchmarkTest {
         "vosk" -> VoskTranscriber(context)
         "sherpa" -> SherpaOnnxTranscriber(context)
         "sensevoice" -> SenseVoiceTranscriber(context)
-        else -> error("unknown latencyAsr '$name' (vosk|whisper|sherpa|sensevoice)")
+        "auto" -> SherpaAutoTranscriber(context)
+        else -> error("unknown latencyAsr '$name' (vosk|whisper|sherpa|sensevoice|auto)")
     }
 
     private fun copyAssetToCache(assetPath: String): File {

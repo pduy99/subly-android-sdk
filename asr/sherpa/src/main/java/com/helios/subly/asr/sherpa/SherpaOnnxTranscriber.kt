@@ -138,13 +138,13 @@ class SherpaOnnxTranscriber internal constructor(
                 // debounce and endpoint emission, so partials and finals stay
                 // consistent — a caption that flips case as it finalises is
                 // worse than either form on its own.
-                val text = CasingNormalizer.normalise(result.text.trim(), atSentenceStart)
+                val text = CasingNormalizer.normalise(stripLeadingPunctuation(result.text), atSentenceStart)
 
                 pendingText = text
 
                 if (result.isEndpoint) {
                     pendingText = ""
-                    if (text.isNotEmpty()) {
+                    if (text.any { it.isLetterOrDigit() }) {
                         // Casing is normalised above; punctuation is not.
                         // Sherpa is the low-latency streaming engine, and
                         // restoring terminators at endpoints writes periods
@@ -202,7 +202,7 @@ class SherpaOnnxTranscriber internal constructor(
                                 backend.decode(h)
                             }
                         }
-                        val text = decoded?.text?.trim().orEmpty()
+                        val text = decoded?.text?.let(::stripLeadingPunctuation).orEmpty()
                         if (text.isNotEmpty()) {
                             pendingText = CasingNormalizer.normalise(text, atSentenceStart)
                         }
@@ -415,7 +415,18 @@ class SherpaOnnxTranscriber internal constructor(
 
         /** Terminators across the scripts this SDK captions, incl. full-width. */
         val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '。', '！', '？')
+
+        /** Punctuation that can only close what came before. */
+        val LEADING_JUNK = charArrayOf('.', ',', ';', ':', '!', '?', '。', '，', '、', '！', '？')
     }
+
+    /**
+     * The Kroko models put the full stop that ends one utterance at the start
+     * of the next (". Alloys are…"), which sentence assembly would caption as
+     * a lone ".". Opening marks (¿ ¡ « “) are kept.
+     */
+    private fun stripLeadingPunctuation(text: String): String =
+        text.trim().trimStart { it.isWhitespace() || it in LEADING_JUNK }
 
     private fun punctuate(text: String): String =
         if ("zh" in model.languages) punctuator.punctuate(text) else text
