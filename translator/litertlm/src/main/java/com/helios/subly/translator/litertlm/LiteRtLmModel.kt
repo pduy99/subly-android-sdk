@@ -25,6 +25,9 @@ import android.content.Context
  * @property supportedLanguages BCP-47 tags the model card claims. A claim,
  *   not a measurement — the SDK cannot verify an LLM's language coverage.
  * @property promptStyle How the model expects to be asked to translate.
+ * @property speculativeDecoding Whether to decode with the checkpoint's
+ *   multi-token-prediction drafter: a small model proposes several tokens
+ *   and the main one verifies them in one pass. Same output, fewer passes.
  */
 enum class LiteRtLmModel(
     val fileName: String,
@@ -33,6 +36,7 @@ enum class LiteRtLmModel(
     val maxNumTokens: Int,
     val supportedLanguages: List<String>,
     val promptStyle: PromptStyle = PromptStyle.SYSTEM_INSTRUCTION,
+    val speculativeDecoding: Boolean = false,
 ) {
     /**
      * Qwen2.5 1.5B Instruct, int8, exported with a 4096-token kv cache.
@@ -115,6 +119,8 @@ enum class LiteRtLmModel(
         approxSizeBytes = 2_588_147_712L,
         maxNumTokens = 1024,
         supportedLanguages = GEMMA4_LANGUAGES,
+        // The card reports up to 2.2x faster decode with its drafter.
+        speculativeDecoding = true,
     ),
 
     /** Gemma 4 E4B instruct (Apache-2.0): about twice E2B's compute per token. */
@@ -126,6 +132,7 @@ enum class LiteRtLmModel(
         approxSizeBytes = 3_659_530_240L,
         maxNumTokens = 1024,
         supportedLanguages = GEMMA4_LANGUAGES,
+        speculativeDecoding = true,
     ),
 
     /**

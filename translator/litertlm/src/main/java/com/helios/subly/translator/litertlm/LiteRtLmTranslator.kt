@@ -10,6 +10,8 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
@@ -83,6 +85,7 @@ class LiteRtLmTranslator internal constructor(
     private val threadCount: Int,
     private val preferredDelegates: List<DelegateType>,
     private val contextLines: Int = DEFAULT_CONTEXT_LINES,
+    private val speculativeDecoding: Boolean = model.speculativeDecoding,
 ) : SublyTranslator, IncrementalTranslator, AccelerationAware {
 
     /**
@@ -96,6 +99,8 @@ class LiteRtLmTranslator internal constructor(
      *   appended as the last resort if missing. NPU is only useful with a
      *   checkpoint compiled for the device's NPU; the default model is not,
      *   so the default skips it.
+     * @param speculativeDecoding overrides [LiteRtLmModel.speculativeDecoding],
+     *   for A/B measurement.
      */
     @JvmOverloads
     constructor(
@@ -104,10 +109,12 @@ class LiteRtLmTranslator internal constructor(
         preferredDelegates: List<DelegateType> = DEFAULT_DELEGATES,
         model: LiteRtLmModel = LiteRtLmModel.forDevice(context),
         contextLines: Int = DEFAULT_CONTEXT_LINES,
+        speculativeDecoding: Boolean = model.speculativeDecoding,
     ) : this(
         context = context,
         model = model,
         contextLines = contextLines,
+        speculativeDecoding = speculativeDecoding,
         loader = LiteRtLmModelLoader(context, modelDownloader),
         threadCount = defaultThreadCount(),
         preferredDelegates = preferredDelegates,
@@ -395,7 +402,8 @@ class LiteRtLmTranslator internal constructor(
         accelerationReport = report
         Log.i(
             TAG,
-            "LiteRT-LM engine ready (${model.fileName}) on ${report.active}; attempts: " +
+            "LiteRT-LM engine ready (${model.fileName}) on ${report.active}, " +
+                "speculative decoding ${if (speculativeDecoding) "on" else "off"}; attempts: " +
                 attempts.joinToString { "${it.delegate} ${if (it.succeeded) "ok" else it.failure} ${it.initMs}ms" },
         )
         emit(ModelPrepState.Ready)
@@ -421,6 +429,10 @@ class LiteRtLmTranslator internal constructor(
         guard.arm(delegate.name)
         val proven = provenMarker(delegate)
         val result = runCatching {
+            // Read by Engine.initialize(); process-global, but one engine is
+            // initialised at a time (under the crash guard above).
+            @OptIn(ExperimentalApi::class)
+            ExperimentalFlags.enableSpeculativeDecoding = speculativeDecoding
             val candidate = Engine(
                 EngineConfig(
                     modelPath = loader.modelFile(model).absolutePath,

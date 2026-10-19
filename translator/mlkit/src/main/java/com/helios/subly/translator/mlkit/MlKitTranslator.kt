@@ -43,17 +43,17 @@ class MlKitTranslator(
         }
     }
 
-    override fun prepareModel(languageConfig: LanguageConfig): Flow<ModelPrepState> = flow {
+    override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
         try {
             emit(ModelPrepState.Checking)
 
-            val sourceTag = TranslateLanguage.fromLanguageTag(languageConfig.source)
-            val targetTag = TranslateLanguage.fromLanguageTag(languageConfig.target)
+            val sourceTag = TranslateLanguage.fromLanguageTag(config.source)
+            val targetTag = TranslateLanguage.fromLanguageTag(config.target)
 
             if (sourceTag == null || targetTag == null) {
                 throw IllegalArgumentException(
-                    "Unsupported language pair: '${languageConfig.source}' -> " +
-                            "'${languageConfig.target}'. See TranslateLanguage for supported tags."
+                    "Unsupported language pair: '${config.source}' -> " +
+                            "'${config.target}'. See TranslateLanguage for supported tags."
                 )
             }
 
@@ -81,7 +81,7 @@ class MlKitTranslator(
             }
             if (downloaded == null) {
                 emit(ModelPrepState.Error(TimeoutException(
-                    "ML Kit model download for ${languageConfig.source}->${languageConfig.target} " +
+                    "ML Kit model download for ${config.source}->${config.target} " +
                         "did not finish in ${DOWNLOAD_TIMEOUT_MS / 60_000} min"
                 )))
                 return@flow

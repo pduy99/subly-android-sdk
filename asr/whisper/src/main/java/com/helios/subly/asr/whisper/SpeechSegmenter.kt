@@ -107,7 +107,7 @@ class SpeechSegmenter(
                         "segment close reason=${if (maxReached) "max" else "silence"} " +
                                 "segment_ms=$segmentMs close_wait_ms=$silentMsAccum " +
                                 "partials=$partialsEmitted kept=$kept start_ts=$segmentStartMs " +
-                                "thr=${gate!!.threshold} floor=${gate!!.noiseFloor}"
+                                "thr=${gate.threshold} floor=${gate.noiseFloor}"
                     )
                     // Cut at the cap with the speaker still going: the
                     // utterance runs on into the next window.

@@ -115,4 +115,34 @@ That is the next gap to close on those two languages.
 ## Not yet measured
 
 - Gemma 4 E2B on 8 GB phones. Google's card gives about 0.7 GB of GPU memory, so it may replace ML Kit on the Galaxy S10, whose ML Kit downloads share the hang above. The S10 was not connected for this work.
-- Gemma 4 E2B with multi-token prediction (Google reports up to 2.2 times faster decode). It needs a newer LiteRT-LM than 0.16.1.
+
+## LiteRT-LM 0.18 and multi-token prediction
+
+The SDK moved to LiteRT-LM 0.18.0 for Gemma 4's multi-token prediction (speculative decoding with the checkpoint's drafter).
+`TranslatorModelProbeTest`, FLEURS, 15 sentences x 8 directions, Galaxy S24 Ultra.
+The runs alternated on/off/on/off, because the phone heated from thermal status 1 to 2 over the runs.
+
+| Gemma 4 E2B | first token p50 | sentence p50 | decode (output chars/s) | chrF |
+|---|---|---|---|---|
+| MTP off | 519 ms | 1,987 ms | 65.6 | 49.6 |
+| MTP on | 566 ms | 1,615 ms | 82.6 | 49.4 |
+
+MTP is 19% faster per sentence and decodes 26% faster, at the same quality (the chrF difference is inside run-to-run noise).
+That is well short of Google's "up to 2.2x", which was measured on a newer phone.
+It is on by default (`LiteRtLmModel.speculativeDecoding`).
+
+0.16.1 and 0.18.0 without MTP measured the same, back to back on the same phone: 2,148 against 2,181 ms per sentence.
+The GPU is not bit-exact between runs either: two runs with identical settings gave identical output for only 39 of 120 sentences.
+
+To repeat the A/B:
+
+```
+./gradlew :benchmark:connectedDebugAndroidTest \
+  -Pandroid.injected.androidTest.leaveApksInstalledAfterRun=true \
+  -Pandroid.testInstrumentationRunnerArguments.class=com.helios.subly.benchmark.latency.TranslatorModelProbeTest \
+  -Pandroid.testInstrumentationRunnerArguments.probeSamples=flores \
+  -Pandroid.testInstrumentationRunnerArguments.probeLimit=15 \
+  -Pandroid.testInstrumentationRunnerArguments.probeModels=GEMMA4_E2B_IT \
+  -Pandroid.testInstrumentationRunnerArguments.probeSpeculative=false   # then =true
+benchmark/tools/translator_probe_report.py
+```

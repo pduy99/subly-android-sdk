@@ -63,7 +63,8 @@ Full numbers and reasoning are in `docs/five-language-asr.md`.
 - `HandoverTranslator` prepares both engines at once and is ready with whichever is ready first. ML Kit model downloads have been seen to hang with no error for over 20 minutes, and `MlKitTranslator` now gives up after 5.
 - Translator context (previous lines in the prompt) made small models copy lines, so it is off by default.
 - Translation drafts (clause by clause) are off by default; they made end-of-sentence latency worse with Qwen3-4B and again with Gemma.
-- Stay on LiteRT-LM 0.16.1 for now. 0.18 needs Kotlin 2.4 metadata and broke Hilt in the app. Gemma 4's multi-token prediction needs a newer runtime, which is worth revisiting.
+- LiteRT-LM 0.18.0, built with Kotlin 2.4. AGP 9's built-in Kotlin compiles with the Kotlin it bundles (2.2) unless the Kotlin Gradle plugin is on the classpath, so the root `build.gradle.kts` puts `kotlin-gradle-plugin` (the catalog's `kotlin`) there. The app needs Hilt 2.60+ to read Kotlin 2.4 metadata.
+- Gemma 4 decodes with its multi-token-prediction drafter (`LiteRtLmModel.speculativeDecoding`, set through LiteRT-LM's process-global `ExperimentalFlags` before engine init). On the S24 it is 19% faster per sentence at the same quality (`docs/realtime-translation.md`); `TranslatorModelProbeTest` takes `probeSpeculative=true|false` for the A/B.
 
 ## Real-time pipeline
 
@@ -80,7 +81,7 @@ Full numbers and reasoning are in `docs/five-language-asr.md`.
 ./gradlew :benchmark:validateDataset
 ```
 
-Toolchain: AGP 9.2, Kotlin 2.3, minSdk 31, arm64-v8a only.
+Toolchain: AGP 9.2, Kotlin 2.4, minSdk 31, arm64-v8a only.
 
 ## On-device benchmarks
 
