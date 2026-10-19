@@ -18,9 +18,14 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.transformWhile
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 
 /**
  * Translates with a fast engine until a better, slower-to-load one is ready.
@@ -31,13 +36,16 @@ import kotlinx.coroutines.launch
  * that holds it is the first one Android kills in the background. Making the
  * user wait that long every time they come back is the wrong trade, so:
  *
- *  - [prepareModel] reports [ModelPrepState.Ready] as soon as [fast] is ready
- *    (seconds), and [primary] keeps preparing in the background;
+ *  - [prepareModel] prepares both at once and reports [ModelPrepState.Ready]
+ *    as soon as either is ready: [fast] in seconds usually, [primary] when
+ *    the fast one cannot serve the pair or its download stalls (ML Kit's
+ *    has been seen to hang with no error); the other keeps preparing in the
+ *    background;
  *  - each sentence is translated by whichever engine was ready when it
  *    started, so the hand-over happens at a sentence boundary, never inside
  *    one; the primary is warmed up with one generation before it takes over;
- *  - if [fast] cannot serve the language pair, preparation waits for
- *    [primary] instead, exactly as it would without this class.
+ *  - if neither can serve the pair, preparation fails with the primary's
+ *    error, the one that matters for quality.
  *
  * [primaryState] exposes the background preparation (download progress on a
  * first run) so an app can keep a foreground service alive while it runs.
@@ -71,35 +79,51 @@ class HandoverTranslator<P>(
         get() = if (primaryReady) (primary as? AccelerationAware)?.accelerationReport
         else (fast as? AccelerationAware)?.accelerationReport
 
-    override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
-        emit(ModelPrepState.Checking)
+    override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = channelFlow {
+        send(ModelPrepState.Checking)
+        startPrimaryInBackground(config)
 
-        // The fast engine's progress is the session's progress; its error is
-        // not (the primary may still serve the pair, see below).
         var fastResult: ModelPrepState? = null
-        fast.prepareModel(config)
-            .transformWhile { emit(it); it !is ModelPrepState.Ready && it !is ModelPrepState.Error }
-            .collect { state ->
-                fastResult = state
-                if (state is ModelPrepState.Preparing) emit(state)
+        val fastJob = launch {
+            fast.prepareModel(config)
+                .transformWhile { emit(it); it !is ModelPrepState.Ready && it !is ModelPrepState.Error }
+                .collect { state ->
+                    fastResult = state
+                    if (state is ModelPrepState.Error) Log.w(TAG, "Fast translator unavailable; waiting for the primary", state.cause)
+                }
+        }
+
+        // Ready with whichever engine gets there first. The primary's
+        // progress is the one worth showing: ML Kit reports none.
+        val primaryOutcome = launch {
+            primaryState.collect { state ->
+                if (state is ModelPrepState.Preparing && fastResult !is ModelPrepState.Ready) send(state)
             }
-
-        if (fastResult is ModelPrepState.Ready) {
-            startPrimaryInBackground(config)
-            emit(ModelPrepState.Ready)
-            return@flow
         }
-
-        // The fast engine cannot serve this pair: wait for the primary, the
-        // same experience as having only the primary.
-        Log.w(TAG, "Fast translator unavailable ($fastResult); waiting for the primary")
-        primaryJob?.cancel()
-        primaryReady = false
-        primary.prepareModel(config).collect { state ->
-            _primaryState.value = state
-            if (state is ModelPrepState.Ready) primaryReady = true
-            emit(state)
+        val primaryUsable = async { primaryUsableFlow.first { it } }
+        val outcome = select<ModelPrepState?> {
+            fastJob.onJoin { fastResult }
+            primaryUsable.onAwait { ModelPrepState.Ready }
         }
+        primaryUsable.cancel()
+        val result = when {
+            outcome is ModelPrepState.Ready -> outcome
+            // The fast engine failed: the primary decides.
+            else -> primaryTerminal()
+        }
+        primaryOutcome.cancel()
+        if (result is ModelPrepState.Ready && fastResult !is ModelPrepState.Ready) fastJob.cancel()
+        send(result)
+    }
+
+    /** Loaded and warmed up, so the first caption after the hand-over pays nothing extra. */
+    private val primaryUsableFlow = MutableStateFlow(false)
+
+    /** Suspends until the primary is usable or has failed. */
+    private suspend fun primaryTerminal(): ModelPrepState {
+        val (usable, state) = combine(primaryUsableFlow, primaryState) { usable, state -> usable to state }
+            .first { (usable, state) -> usable || state is ModelPrepState.Error }
+        return if (usable) ModelPrepState.Ready else requireNotNull(state)
     }
 
     /**
@@ -118,8 +142,10 @@ class HandoverTranslator<P>(
                         // on the first caption after the hand-over.
                         runCatching { primary.translate(WARM_UP_TEXT) }
                         primaryReady = true
+                        primaryUsableFlow.value = true
                         Log.i(TAG, "Primary translator ready; handing over at the next sentence")
                     }
+                    if (state is ModelPrepState.Ready && primaryReady) primaryUsableFlow.value = true
                     if (state is ModelPrepState.Error) {
                         Log.w(TAG, "Primary translator failed to prepare; staying on the fast one", state.cause)
                     }

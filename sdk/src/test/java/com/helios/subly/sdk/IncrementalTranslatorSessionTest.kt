@@ -103,6 +103,7 @@ class IncrementalTranslatorSessionTest {
             asrEngine = asr,
             translationEngine = translator,
             restorePunctuation = false,
+            livePreview = false,
         )
 
         val captions = runBlocking {
@@ -137,6 +138,7 @@ class IncrementalTranslatorSessionTest {
             translationEngine = translator,
             restorePunctuation = false,
             translationDrafts = true,
+            livePreview = false,
         )
 
         val captions = runBlocking {
@@ -169,5 +171,80 @@ class IncrementalTranslatorSessionTest {
         assertEquals("the man who lives next door.", final.originalText)
         assertEquals("THE MAN WHO LIVES NEXT DOOR.", final.translatedText)
         assertTrue(captions.any { !it.isFinal && it.translatedText == "THE MAN WHO LIVES" })
+    }
+
+    @Test
+    fun `a live preview translates the sentence while it is spoken`() {
+        val asr = FakeAsr()
+        val translator = SlowIncrementalTranslator(generationMs = 300)
+        val session = SublySession(
+            initialConfig = LanguageConfig(source = "en", target = "fr"),
+            audioCapture = FakeCapture(),
+            asrEngine = asr,
+            translationEngine = translator,
+            restorePunctuation = false,
+        )
+
+        val captions = runBlocking {
+            val captions = CopyOnWriteArrayList<Caption>()
+            val sawFinal = CompletableDeferred<Unit>()
+            val collector = launch(Dispatchers.Default) {
+                session.captions.collect {
+                    captions += it
+                    if (it.isFinal) sawFinal.complete(Unit)
+                }
+            }
+            delay(100)
+            session.start()
+            withTimeout(10_000) { sawFinal.await() }
+            collector.cancel()
+            session.close()
+            captions.toList()
+        }
+
+        // During the pause the sentence so far was translated as a preview.
+        assertTrue(captions.any { !it.isFinal && it.translatedText.startsWith("THE MAN WHO LIVES") })
+        assertEquals("THE MAN WHO LIVES NEXT DOOR.", captions.last { it.isFinal }.translatedText)
+    }
+
+    @Test
+    fun `a preview gives way to the final at once`() {
+        val asr = object : SublyAsr {
+            val finishedEmitting = CompletableDeferred<Long>()
+            override fun transcribe(frames: Flow<AudioFrame>): Flow<AsrResult> = flow {
+                emit(AsrResult.Partial("the man who lives next"))
+                delay(200) // a preview is generating now
+                emit(AsrResult.Final("the man who lives next door."))
+                finishedEmitting.complete(System.nanoTime())
+            }
+            override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flowOf(ModelPrepState.Ready)
+            override fun release() = Unit
+            override fun supportedLanguages(): List<String> = listOf("en")
+        }
+        val translator = SlowIncrementalTranslator(generationMs = 2_000)
+        val session = SublySession(
+            initialConfig = LanguageConfig(source = "en", target = "fr"),
+            audioCapture = FakeCapture(),
+            asrEngine = asr,
+            translationEngine = translator,
+            restorePunctuation = false,
+        )
+
+        runBlocking {
+            val sawFinal = CompletableDeferred<Long>()
+            val collector = launch(Dispatchers.Default) {
+                session.captions.collect { if (it.isFinal) sawFinal.complete(System.nanoTime()) }
+            }
+            delay(100)
+            session.start()
+            val finalAt = withTimeout(10_000) { sawFinal.await() }
+            val asrFinalAt = asr.finishedEmitting.await()
+            // One generation, not the preview's remainder and then the final's.
+            assertTrue("final waited for the preview", (finalAt - asrFinalAt) / 1_000_000 < 3_000)
+            collector.cancel()
+            session.close()
+        }
+        assertEquals("the man who lives next", translator.appends.first())
+        assertEquals("the man who lives next door.", translator.appends.last())
     }
 }

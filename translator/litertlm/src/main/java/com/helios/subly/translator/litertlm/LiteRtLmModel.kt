@@ -12,10 +12,9 @@ import android.content.Context
  * seconds per caption, and buys context-aware output that a per-pair NMT
  * model cannot produce. Pick per product, not per benchmark.
  *
- * Only ungated, redistributable checkpoints are listed. Gemma builds are
- * deliberately absent: they are the stronger models, but the Gemma Terms of
- * Use are not an OSI licence and restrict downstream use, which is the wrong
- * default for an SDK that third parties redistribute.
+ * Only ungated, redistributable (Apache-2.0) checkpoints are listed. Gemma 3
+ * and earlier are absent because the Gemma Terms of Use restrict downstream
+ * use; Gemma 4 is Apache-2.0.
  *
  * @property fileName Stable name under `filesDir/litertlm/`.
  * @property downloadUrl Direct URL. Repoint at your own mirror for production
@@ -25,6 +24,7 @@ import android.content.Context
  * @property maxNumTokens litertlm kv-cache size (input + output tokens).
  * @property supportedLanguages BCP-47 tags the model card claims. A claim,
  *   not a measurement — the SDK cannot verify an LLM's language coverage.
+ * @property promptStyle How the model expects to be asked to translate.
  */
 enum class LiteRtLmModel(
     val fileName: String,
@@ -32,6 +32,7 @@ enum class LiteRtLmModel(
     val approxSizeBytes: Long,
     val maxNumTokens: Int,
     val supportedLanguages: List<String>,
+    val promptStyle: PromptStyle = PromptStyle.SYSTEM_INSTRUCTION,
 ) {
     /**
      * Qwen2.5 1.5B Instruct, int8, exported with a 4096-token kv cache.
@@ -96,7 +97,69 @@ enum class LiteRtLmModel(
             "hu", "id", "it", "ja", "ko", "ms", "nl", "no", "pl", "pt", "ro", "ru", "sv", "th",
             "tr", "uk", "vi", "zh",
         ),
+    ),
+
+    /**
+     * Gemma 4 E2B instruct (Apache-2.0), Google's mixed 2/4/8-bit mobile
+     * quantisation. About 2B effective parameters per token, with
+     * per-layer embeddings memory-mapped rather than resident.
+     *
+     * Google's card: 52 tok/s decode, 0.3 s to first token and 676 MB on a
+     * Galaxy S26 Ultra GPU.
+     */
+    GEMMA4_E2B_IT(
+        fileName = "gemma-4-E2B-it.litertlm",
+        downloadUrl =
+            "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/" +
+                "b3ca0d2f076785a8f4b2219ddbd2bdb99954eae1/gemma-4-E2B-it.litertlm",
+        approxSizeBytes = 2_588_147_712L,
+        maxNumTokens = 1024,
+        supportedLanguages = GEMMA4_LANGUAGES,
+    ),
+
+    /** Gemma 4 E4B instruct (Apache-2.0): about twice E2B's compute per token. */
+    GEMMA4_E4B_IT(
+        fileName = "gemma-4-E4B-it.litertlm",
+        downloadUrl =
+            "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/" +
+                "2eee7ac325f20eb8c9ac1d0e972f7c84663062da/gemma-4-E4B-it.litertlm",
+        approxSizeBytes = 3_659_530_240L,
+        maxNumTokens = 1024,
+        supportedLanguages = GEMMA4_LANGUAGES,
+    ),
+
+    /**
+     * Hy-MT2-1.8B (Tencent, Apache-2.0), int8: a translation model, not a
+     * chat model. 33 languages; on FLORES-200 its authors report about 90%
+     * of Gemini 3.1 Pro's XCOMET score across all directions.
+     */
+    HY_MT2_1_8B(
+        fileName = "Hy-MT2-1.8B_int8.litertlm",
+        downloadUrl =
+            "https://huggingface.co/litert-community/Hy-MT2-1.8B/resolve/" +
+                "0d2c5681276f71b61c4f2a14fbb9791341b28017/Hy-MT2-1.8B_int8.litertlm",
+        approxSizeBytes = 1_827_026_224L,
+        maxNumTokens = 1024,
+        supportedLanguages = listOf(
+            "ar", "bn", "cs", "de", "en", "es", "fa", "fr", "gu", "he", "hi", "id", "it", "ja",
+            "kk", "km", "ko", "mn", "mr", "ms", "my", "nl", "pl", "pt", "ru", "ta", "te", "th",
+            "tl", "tr", "uk", "ur", "vi", "zh",
+        ),
+        promptStyle = PromptStyle.HY_MT,
     );
+
+    /** How a model is asked to translate. */
+    enum class PromptStyle {
+        /** A chat model: the task in the system instruction, the text as the user message. */
+        SYSTEM_INSTRUCTION,
+
+        /**
+         * Hunyuan-MT: no system prompt; the instruction and the text in one
+         * user message, in Chinese when either side is Chinese. One message
+         * per conversation: its chat template cannot extend a conversation.
+         */
+        HY_MT,
+    }
 
     companion object {
         /** The model that runs everywhere the SDK does. */
@@ -121,7 +184,7 @@ enum class LiteRtLmModel(
          * subtitle, so the 4B model is chosen wherever memory allows.
          */
         fun forDevice(context: Context): LiteRtLmModel =
-            if (canRunLargeModel(context)) QWEN3_4B_INSTRUCT_2507_INT4 else Default
+            if (canRunLargeModel(context)) GEMMA4_E2B_IT else Default
 
         /**
          * Whether this device can run [QWEN3_4B_INSTRUCT_2507_INT4]. Below
@@ -138,3 +201,12 @@ enum class LiteRtLmModel(
         }
     }
 }
+
+/**
+ * Languages Gemma 4 handles well that the SDK can transcribe. Top level, not
+ * in the companion: enum entries are built before the companion exists.
+ */
+private val GEMMA4_LANGUAGES = listOf(
+    "ar", "de", "en", "es", "fr", "hi", "id", "it", "ja", "ko", "nl", "pl", "pt", "ru",
+    "th", "tr", "uk", "vi", "zh",
+)

@@ -26,7 +26,7 @@ import org.junit.Test
  */
 class TranslatorModelProbeTest {
 
-    data class Sample(val source: String, val target: String, val text: String)
+    data class Sample(val source: String, val target: String, val text: String, val reference: String? = null)
 
     data class Result(
         val model: String,
@@ -36,6 +36,7 @@ class TranslatorModelProbeTest {
         val target: String,
         val input: String,
         val output: String,
+        val reference: String?,
         val ttftMs: Long,
         val totalMs: Long,
         val error: String?,
@@ -48,6 +49,7 @@ class TranslatorModelProbeTest {
             ?.split(',')?.map { it.trim() }?.toSet()
         val samples = when (InstrumentationRegistry.getArguments().getString("probeSamples")) {
             "zh_vi" -> ZH_VI_SAMPLES
+            "flores" -> floresSamples()
             else -> SAMPLES
         }
         val results = ArrayList<Result>()
@@ -69,7 +71,7 @@ class TranslatorModelProbeTest {
                         val out = runCatching { mlkit.translate(sample.text) }
                         val ms = (System.nanoTime() - t0) / 1_000_000
                         results += Result("MLKIT", "CPU", prepareMs, sample.source, sample.target, sample.text,
-                            out.getOrDefault(""), ms, ms,
+                            out.getOrDefault(""), sample.reference, ms, ms,
                             if (state is ModelPrepState.Error) "prepare failed: ${state.cause}" else out.exceptionOrNull()?.toString())
                         Log.i(TAG, "probe ${results.last()}")
                     }
@@ -96,7 +98,7 @@ class TranslatorModelProbeTest {
                         val out = runCatching { second.translate(first.translate(sample.text)) }
                         val ms = (System.nanoTime() - t0) / 1_000_000
                         results += Result("MLKIT_PIVOT_EN", "CPU", 0, sample.source, sample.target, sample.text,
-                            out.getOrDefault(""), ms, ms, out.exceptionOrNull()?.toString())
+                            out.getOrDefault(""), sample.reference, ms, ms, out.exceptionOrNull()?.toString())
                         Log.i(TAG, "probe ${results.last()}")
                     }
                 }
@@ -127,7 +129,7 @@ class TranslatorModelProbeTest {
                     for (sample in group) {
                         results += if (state is ModelPrepState.Error) {
                             Result(model.name, delegate, prepareMs, sample.source, sample.target, sample.text,
-                                "", -1, -1, "prepare failed: ${state.cause}")
+                                "", sample.reference, -1, -1, "prepare failed: ${state.cause}")
                         } else {
                             translateOnce(translator, model, delegate, prepareMs, sample)
                         }
@@ -172,14 +174,33 @@ class TranslatorModelProbeTest {
             target = sample.target,
             input = sample.text,
             output = output,
+            reference = sample.reference,
             ttftMs = if (firstAt < 0) -1 else (firstAt - start) / 1_000_000,
             totalMs = (end - start) / 1_000_000,
             error = error?.toString(),
         )
     }
 
+    /**
+     * FLEURS sentences in all five app languages (`dataset/parallel`), one
+     * per `probeDirections` entry (default: the directions the app is used
+     * in most). Each carries the reference translation, for chrF on the host.
+     */
+    private fun floresSamples(): List<Sample> {
+        val json = InstrumentationRegistry.getInstrumentation().context.assets
+            .open("dataset/parallel/flores_parallel.json").bufferedReader().readText()
+        val rows = com.google.gson.JsonParser.parseString(json).asJsonArray.map { it.asJsonObject }
+        val limit = InstrumentationRegistry.getArguments().getString("probeLimit")?.toInt() ?: rows.size
+        val directions = (InstrumentationRegistry.getArguments().getString("probeDirections") ?: DEFAULT_DIRECTIONS)
+            .split(',').map { it.trim().split('-').let { (s, t) -> s to t } }
+        return directions.flatMap { (s, t) ->
+            rows.take(limit).map { Sample(s, t, it[s].asString, it[t].asString) }
+        }
+    }
+
     private companion object {
         const val TAG = "TranslatorProbe"
+        const val DEFAULT_DIRECTIONS = "zh-vi,en-vi,ja-vi,es-vi,vi-en,zh-en,ja-en,en-zh"
         const val PREPARE_TIMEOUT_MS = 45 * 60 * 1_000L
 
         val SAMPLES = listOf(

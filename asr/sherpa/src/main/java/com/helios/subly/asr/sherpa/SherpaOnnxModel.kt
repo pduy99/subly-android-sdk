@@ -52,6 +52,12 @@ internal enum class SherpaOnnxModel(
      * [CaptionEndpointTuning.RUN_ON_CAP].
      */
     val maxSegmentSec: Float = 12f,
+    /**
+     * Whether the model writes its own punctuation. For one that does, a
+     * final without a terminator is a sentence cut by a pause, not one that
+     * ended: "…one of the guys, or" / "gals."
+     */
+    val punctuates: Boolean = false,
 ) {
     /**
      * ASR: English streaming Zipformer transducer from Kroko (2025-08-06),
@@ -74,6 +80,7 @@ internal enum class SherpaOnnxModel(
         approxSizeBytes = 71_053_214L,
         languages = setOf("en"),
         numThreads = 2,
+        punctuates = true,
     ),
 
     /**
@@ -131,6 +138,7 @@ internal enum class SherpaOnnxModel(
         approxSizeBytes = 155_838_792L,
         languages = setOf("es"),
         numThreads = 2,
+        punctuates = true,
     ),
 
     /**
@@ -162,9 +170,10 @@ internal enum class SherpaOnnxModel(
         // Measured in the app: with the default pause a 9.4 s segment
         // decoded as one word ("これ"); the model is reliable on the short
         // segments it was trained on, and Japanese readers pause at the end
-        // of a sentence anyway.
+        // of a sentence anyway. Cap measured on five FLEURS clips (Galaxy
+        // S24 Ultra): 17.3% CER at 8 s, 14.7% at 6 s, 16.5% at 5 s.
         vadMinSilenceSec = 0.3f,
-        maxSegmentSec = 8f,
+        maxSegmentSec = 6f,
     ),
 
     /**

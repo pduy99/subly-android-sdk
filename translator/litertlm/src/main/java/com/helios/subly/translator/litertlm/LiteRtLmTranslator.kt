@@ -161,7 +161,7 @@ class LiteRtLmTranslator internal constructor(
                 val conversation = activeEngine.createConversation(requireNotNull(conversationConfig))
                 activeConversation = conversation
                 val raw = try {
-                    textOf(conversation.sendMessage(source))
+                    textOf(conversation.sendMessage(request(source)))
                 } finally {
                     activeConversation = null
                     conversation.close()
@@ -195,6 +195,12 @@ class LiteRtLmTranslator internal constructor(
             inferenceLock.withLock {
                 val activeEngine = engine
                     ?: throw IllegalStateException("Translator was released mid-translation.")
+                // A model that cannot extend a conversation translates each
+                // piece in a conversation of its own.
+                if (model.promptStyle == LiteRtLmModel.PromptStyle.HY_MT) {
+                    conversation?.let { runCatching { it.close() } }
+                    conversation = null
+                }
                 val conv = conversation
                     ?: activeEngine.createConversation(requireNotNull(incrementalConfig))
                         .also { conversation = it }
@@ -203,10 +209,11 @@ class LiteRtLmTranslator internal constructor(
                 activeConversation = conv
                 // The sentence's first message carries the conversation so
                 // far; later pieces already have it in the conversation.
-                val message = if (sources.isEmpty()) {
-                    TranslationPrompt.withContext(piece, synchronized(recentLines) { recentLines.toList() })
-                } else {
-                    piece
+                val message = when {
+                    model.promptStyle == LiteRtLmModel.PromptStyle.HY_MT -> request(piece)
+                    sources.isEmpty() ->
+                        TranslationPrompt.withContext(piece, synchronized(recentLines) { recentLines.toList() })
+                    else -> piece
                 }
                 try {
                     streamTokens(conv, message).collect { chunk ->
@@ -309,11 +316,12 @@ class LiteRtLmTranslator internal constructor(
         }
         sourceTag = config.source
         targetTag = config.target
+        val chat = model.promptStyle == LiteRtLmModel.PromptStyle.SYSTEM_INSTRUCTION
         conversationConfig = buildConversationConfig(
-            TranslationPrompt.systemInstruction(sourceTag, targetTag), MAX_OUTPUT_TOKENS,
+            TranslationPrompt.systemInstruction(sourceTag, targetTag).takeIf { chat }, MAX_OUTPUT_TOKENS,
         )
         incrementalConfig = buildConversationConfig(
-            TranslationPrompt.incrementalInstruction(sourceTag, targetTag), MAX_OUTPUT_TOKENS,
+            TranslationPrompt.incrementalInstruction(sourceTag, targetTag).takeIf { chat }, MAX_OUTPUT_TOKENS,
         )
 
         if (engine != null) {
@@ -435,7 +443,11 @@ class LiteRtLmTranslator internal constructor(
                 } else {
                     val probeStart = System.nanoTime()
                     candidate.createConversation(
-                        buildConversationConfig(TranslationPrompt.systemInstruction("en", "en"), PROBE_OUTPUT_TOKENS)
+                        buildConversationConfig(
+                            TranslationPrompt.systemInstruction("en", "en")
+                                .takeIf { model.promptStyle == LiteRtLmModel.PromptStyle.SYSTEM_INSTRUCTION },
+                            PROBE_OUTPUT_TOKENS,
+                        )
                     ).use { it.sendMessage("Hi") }
                     proven.parentFile?.mkdirs()
                     runCatching { proven.writeText(Build.FINGERPRINT) }
@@ -505,8 +517,14 @@ class LiteRtLmTranslator internal constructor(
 
     override fun supportedLanguages(): List<String> = model.supportedLanguages
 
-    private fun buildConversationConfig(instruction: String, maxOutputTokens: Int) = ConversationConfig(
-        systemInstruction = Contents.of(instruction),
+    /** The user message for [text]: the text itself, or the whole request for models without a system prompt. */
+    private fun request(text: String): String = when (model.promptStyle) {
+        LiteRtLmModel.PromptStyle.SYSTEM_INSTRUCTION -> text
+        LiteRtLmModel.PromptStyle.HY_MT -> TranslationPrompt.hyMtMessage(text, sourceTag, targetTag)
+    }
+
+    private fun buildConversationConfig(instruction: String?, maxOutputTokens: Int) = ConversationConfig(
+        systemInstruction = instruction?.let { Contents.of(it) },
         // topK = 1 is greedy decoding, which makes temperature and topP
         // inert. Greedy on purpose: a translator inside an accuracy benchmark
         // has to be reproducible, and sampling buys variety that a subtitle

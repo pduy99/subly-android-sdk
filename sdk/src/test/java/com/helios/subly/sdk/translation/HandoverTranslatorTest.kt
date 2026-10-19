@@ -20,11 +20,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 class HandoverTranslatorTest {
 
-    private class Fast(private val serves: Boolean = true) : SublyTranslator {
+    private class Fast(private val serves: Boolean = true, private val hangs: Boolean = false) : SublyTranslator {
         var released = false
         override suspend fun translate(text: String) = "fast:$text"
         override fun prepareModel(config: LanguageConfig): Flow<ModelPrepState> = flow {
             emit(ModelPrepState.Preparing(0.5f))
+            if (hangs) delay(Long.MAX_VALUE) // a download that never finishes
             emit(if (serves) ModelPrepState.Ready else ModelPrepState.Error(IllegalArgumentException("pair")))
         }
         override fun release() { released = true }
@@ -109,6 +110,16 @@ class HandoverTranslatorTest {
         val states = handover.prepareModel(pair).toList()
         assertEquals(ModelPrepState.Ready, states.last())
         assertTrue(states.none { it is ModelPrepState.Error })
+        assertTrue(handover.isUsingPrimary)
+        assertEquals("llm:你好", handover.translate("你好"))
+        handover.release()
+    }
+
+    @Test
+    fun `a fast engine stuck downloading does not block a primary that is ready`() = runBlocking {
+        val handover = HandoverTranslator(Fast(hangs = true), Primary(loadMs = 200))
+        val states = withTimeout(5_000) { handover.prepareModel(pair).toList() }
+        assertEquals(ModelPrepState.Ready, states.last())
         assertTrue(handover.isUsingPrimary)
         assertEquals("llm:你好", handover.translate("你好"))
         handover.release()

@@ -55,6 +55,9 @@ class SherpaAutoTranscriber internal constructor(
     @Volatile
     private var active: SublyAsr? = null
 
+    override val capitalisesOnlySentenceStarts: Boolean
+        get() = active?.capitalisesOnlySentenceStarts ?: false
+
     override val accelerationReport: AccelerationReport?
         get() = (active as? AccelerationAware)?.accelerationReport
 
