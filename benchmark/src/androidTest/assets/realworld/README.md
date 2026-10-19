@@ -12,5 +12,5 @@ that repeated four earlier lines verbatim was dropped, and 咔嚢 was corrected
 to 咔嚓. There is no human reference translation; translations are judged
 against the transcript.
 
-Used by `latency/RealWorldAsrProbeTest` (recogniser comparison) and the
+Used by `latency/AsrProbeTest` (recogniser comparison) and the
 latency harness (`latencyClips=zh_dialogue_01`).
