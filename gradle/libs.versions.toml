@@ -4,7 +4,7 @@ targetSdk = "36"
 compileSdk = "36"
 compileSdkMinor = "1"
 agp = "9.2.0-rc01"
-kotlin = "2.3.21"
+kotlin = "2.4.21"
 junit = "4.13.2"
 junitVersion = "1.3.0"
 espressoCore = "3.7.0"
@@ -30,7 +30,7 @@ vosk = "0.3.75"
 # everything this module uses (Engine/EngineConfig, ConversationConfig with
 # maxOutputToken, SamplerConfig, Contents/Content.Text), so nothing here is
 # waiting on the bump. Revisit when the project moves to Kotlin 2.4.
-litertlm = "0.16.1"
+litertlm = "0.18.0"
 coreKtx = "1.10.1"
 annotation = "1.9.1"
 appcompat = "1.6.1"
@@ -54,6 +54,7 @@ mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition"
 mlkit-translate = { group = "com.google.mlkit", name = "translate", version.ref = "mlkitTranslate" }
 mlkit-language-id = { group = "com.google.mlkit", name = "language-id", version.ref = "mlkitLanguageId" }
 litert-lm = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
+kotlin-gradle-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 anthropic-java = { group = "com.anthropic", name = "anthropic-java", version.ref = "anthropic" }

@@ -297,7 +297,6 @@ class AsrProbeTest {
                                 qwen3Asr.convFrontend = p("conv_frontend.onnx"); qwen3Asr.encoder = p("encoder.int8.onnx")
                                 qwen3Asr.decoder = p("decoder.int8.onnx"); qwen3Asr.tokenizer = p("tokenizer")
                             }
-                            else -> Unit
                         }
                         numThreads = THREADS
                     }

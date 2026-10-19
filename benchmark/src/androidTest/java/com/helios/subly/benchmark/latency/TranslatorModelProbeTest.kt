@@ -23,6 +23,9 @@ import org.junit.Test
  * the path the streaming stage uses, and records the output, time to first
  * token and total time. Writes `translator_probe.json`. Nothing is asserted
  * about the translations: this is for a human, or a judge, to read.
+ *
+ * `probeSpeculative=true|false` overrides the model's speculative decoding
+ * (multi-token prediction); results carry a `+MTP` suffix when it is on.
  */
 class TranslatorModelProbeTest {
 
@@ -114,9 +117,13 @@ class TranslatorModelProbeTest {
             val delegates = InstrumentationRegistry.getArguments().getString("probeDelegates")
                 ?.split(',')?.map { com.helios.subly.core.model.DelegateType.valueOf(it.trim()) }
                 ?: listOf(com.helios.subly.core.model.DelegateType.GPU, com.helios.subly.core.model.DelegateType.CPU)
+            val speculative = InstrumentationRegistry.getArguments().getString("probeSpeculative")?.toBoolean()
+                ?: model.speculativeDecoding
             val translator = LiteRtLmTranslator(
                 context, model = model, contextLines = contextLines, preferredDelegates = delegates,
+                speculativeDecoding = speculative,
             )
+            val label = if (speculative) "${model.name}+MTP" else model.name
             try {
                 for ((pair, group) in samples.groupBy { it.source to it.target }) {
                     val start = System.nanoTime()
@@ -128,10 +135,10 @@ class TranslatorModelProbeTest {
                     val delegate = translator.accelerationReport?.active?.name ?: "none"
                     for (sample in group) {
                         results += if (state is ModelPrepState.Error) {
-                            Result(model.name, delegate, prepareMs, sample.source, sample.target, sample.text,
+                            Result(label, delegate, prepareMs, sample.source, sample.target, sample.text,
                                 "", sample.reference, -1, -1, "prepare failed: ${state.cause}")
                         } else {
-                            translateOnce(translator, model, delegate, prepareMs, sample)
+                            translateOnce(translator, label, delegate, prepareMs, sample)
                         }
                         Log.i(TAG, "probe ${results.last()}")
                     }
@@ -149,7 +156,7 @@ class TranslatorModelProbeTest {
 
     private suspend fun translateOnce(
         translator: LiteRtLmTranslator,
-        model: LiteRtLmModel,
+        model: String,
         delegate: String,
         prepareMs: Long,
         sample: Sample,
@@ -167,7 +174,7 @@ class TranslatorModelProbeTest {
         }.exceptionOrNull()
         val end = System.nanoTime()
         return Result(
-            model = model.name,
+            model = model,
             delegate = delegate,
             prepareMs = prepareMs,
             source = sample.source,
