@@ -33,6 +33,7 @@ class Subly private constructor(
     private val audioCaptureFactory: () -> AudioCapture,
     private val restorePunctuation: Boolean,
     private val translationDrafts: Boolean,
+    private val livePreview: Boolean,
 ) {
 
     /**
@@ -49,6 +50,7 @@ class Subly private constructor(
         translationEngine = translatorFactory(),
         restorePunctuation = restorePunctuation,
         translationDrafts = translationDrafts,
+        livePreview = livePreview,
     )
 
     class Builder {
@@ -59,6 +61,7 @@ class Subly private constructor(
         }
         private var restorePunctuation: Boolean = true
         private var translationDrafts: Boolean = false
+        private var livePreview: Boolean = true
 
         /** Required. Factory invoked once per session. */
         fun setAsrEngine(factory: () -> SublyAsr) = apply { asrEngineFactory = factory }
@@ -112,6 +115,17 @@ class Subly private constructor(
             apply { translationDrafts = enabled }
 
         /**
+         * For incremental (LLM) translators: whether to translate the
+         * sentence still being spoken whenever the translator would
+         * otherwise be idle, and show that until the sentence's final
+         * translation replaces it (default on). Unlike drafts, a preview
+         * never delays committed work: it is cancelled the moment a
+         * committed sentence needs the translator.
+         */
+        fun setLivePreview(enabled: Boolean) =
+            apply { livePreview = enabled }
+
+        /**
          * @throws IllegalArgumentException with an actionable message when a
          * required component is missing — never a bare NPE.
          */
@@ -125,6 +139,7 @@ class Subly private constructor(
             audioCaptureFactory = audioCaptureFactory,
             restorePunctuation = restorePunctuation,
             translationDrafts = translationDrafts,
+            livePreview = livePreview,
         )
     }
 }

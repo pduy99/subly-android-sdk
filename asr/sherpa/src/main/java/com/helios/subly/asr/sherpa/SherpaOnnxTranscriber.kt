@@ -61,6 +61,8 @@ class SherpaOnnxTranscriber internal constructor(
      */
     override val emitsCompleteUtterances: Boolean = true
 
+    override val capitalisesOnlySentenceStarts: Boolean get() = model.punctuates
+
     /** Lazily-initialized recognizer/stream pair. Cleared on [release]. */
     private val handleRef = AtomicReference<SherpaOnnxBackend.Handle?>(null)
 
@@ -153,7 +155,11 @@ class SherpaOnnxTranscriber internal constructor(
                         // finals go out unpunctuated and flow immediately.
                         // NOTE: never log transcript content — it is end-user speech.
                         Log.d(TAG, "Emitted final packet (length=${text.length})")
-                        emit(AsrResult.Final(punctuate(text)))
+                        // A punctuating model that wrote no terminator was
+                        // cut mid-sentence by a pause: let the session join
+                        // it with what follows instead of ending it here.
+                        val ended = !model.punctuates || text.trimEnd().last() in SENTENCE_TERMINATORS
+                        emit(AsrResult.Final(punctuate(text), endsSentence = ended))
                         // The next caption opens a sentence only if this one
                         // closed one. This engine emits no terminators, so in
                         // practice that is false — but it stays correct if a

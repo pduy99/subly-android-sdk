@@ -13,6 +13,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.TimeoutException
 
 /**
  * [SublyTranslator] backed by ML Kit on-device translation.
@@ -69,7 +71,21 @@ class MlKitTranslator(
             // ModelPrepState contract.
             emit(ModelPrepState.Preparing(progress = 0f))
 
-            activeTranslator?.downloadModelIfNeeded(downloadConditions)?.await()
+            // Bounded: a download that never completes (seen on a Galaxy
+            // S24 Ultra, Oct 2026: no progress and no error for 20+ min)
+            // must surface as an error the user can retry, not an endless
+            // "Preparing".
+            val downloaded = withTimeoutOrNull(DOWNLOAD_TIMEOUT_MS) {
+                activeTranslator?.downloadModelIfNeeded(downloadConditions)?.await()
+                true
+            }
+            if (downloaded == null) {
+                emit(ModelPrepState.Error(TimeoutException(
+                    "ML Kit model download for ${languageConfig.source}->${languageConfig.target} " +
+                        "did not finish in ${DOWNLOAD_TIMEOUT_MS / 60_000} min"
+                )))
+                return@flow
+            }
 
             emit(ModelPrepState.Ready)
         } catch (e: CancellationException) {
@@ -94,5 +110,8 @@ class MlKitTranslator(
 
     private companion object {
         const val TAG = "MlKitTranslator"
+
+        /** A language pair is two ~30 MB models; minutes even on a slow link. */
+        const val DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1_000L
     }
 }

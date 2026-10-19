@@ -43,13 +43,19 @@ import kotlin.math.abs
  * Silero-VAD segments, which is how an offline model makes live captions.
  *
  * Writes `asr_probe.json`. Runner arguments: `probeLanguages` (e.g. `ja,vi`)
- * and `probeAsr` (candidate names) narrow the run.
+ * and `probeAsr` (candidate names) narrow the run; `probeClips` (default 2,
+ * up to 5) sets FLEURS clips per language; `probeVadSilence` and
+ * `probeVadMax` (seconds) set the offline models' segmentation.
  */
 class AsrProbeTest {
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context = instrumentation.targetContext
     private val modelRoot = File(context.filesDir, "asr-probe").apply { mkdirs() }
+
+    /** VAD segmentation for offline models: `probeVadSilence` / `probeVadMax` runner arguments. */
+    private var vadMinSilence = 0.3f
+    private var vadMaxSpeech = 8f
 
     data class Clip(val id: String, val language: String, val asset: String, val reference: String)
 
@@ -199,8 +205,11 @@ class AsrProbeTest {
             ?: setOf("en", "zh", "ja", "es", "vi")
         val wanted = args.getString("probeAsr")?.split(',')?.map { it.trim() }?.toSet()
 
+        val clipCount = args.getString("probeClips")?.toInt() ?: 2
+        vadMaxSpeech = args.getString("probeVadMax")?.toFloat() ?: vadMaxSpeech
+        vadMinSilence = args.getString("probeVadSilence")?.toFloat() ?: vadMinSilence
         val clips = langs.flatMap { lang ->
-            (1..2).map { n ->
+            (1..clipCount).map { n ->
                 val id = "fleurs_${lang}_0$n"
                 Clip(id, lang, "dataset/audio/$id.mp4", asset("dataset/references/$id.transcript.txt"))
             }
@@ -370,9 +379,9 @@ class AsrProbeTest {
         val vad = Vad(assetManager = null, config = VadModelConfig().apply {
             sileroVadModelConfig.model = vadPath
             sileroVadModelConfig.threshold = 0.5f
-            sileroVadModelConfig.minSilenceDuration = 0.3f
+            sileroVadModelConfig.minSilenceDuration = vadMinSilence
             sileroVadModelConfig.minSpeechDuration = 0.25f
-            sileroVadModelConfig.maxSpeechDuration = 8f
+            sileroVadModelConfig.maxSpeechDuration = vadMaxSpeech
             sampleRate = SAMPLE_RATE
             numThreads = 1
         })

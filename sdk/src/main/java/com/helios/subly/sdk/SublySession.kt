@@ -32,6 +32,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.transformWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -80,6 +82,7 @@ class SublySession internal constructor(
     private val translationEngine: SublyTranslator,
     private val restorePunctuation: Boolean = true,
     private val translationDrafts: Boolean = false,
+    private val livePreview: Boolean = true,
 ) : AutoCloseable {
 
     /** Current language pair; replaced by [setLanguages]. */
@@ -414,9 +417,12 @@ class SublySession internal constructor(
     private suspend fun runPipeline(frames: Flow<AudioFrame>) {
         val extractor = SentenceExtractor(Locale.forLanguageTag(config.source))
         val extractorMutex = Mutex()
+        val earlyCommitter = EarlyCommitter(Locale.forLanguageTag(config.source))
         resetPartialThrottle()
         lastFinalOriginal = ""
         _translationState.value = TranslationState.Idle
+        // Caption timing against the voice, for `adb logcat -s SublyBench`.
+        val voiceLatency = VoiceLatencyTracker(log = BenchLog::metric)
 
         channelFlow {
             var flushJob: Job? = null
@@ -430,6 +436,7 @@ class SublySession internal constructor(
                 StreamingTranslationStage(
                     translator = translator,
                     policy = WaitKPolicy.forLanguage(config.source).copy(drafts = translationDrafts),
+                    livePreview = livePreview,
                     onState = { state ->
                         _translationState.value = state
                         when (state) {
@@ -454,6 +461,7 @@ class SublySession internal constructor(
             // clauses it already translated; otherwise they are translated here.
             suspend fun emitFinal(sentence: String, kind: String) {
                 for (part in cjkSplitter.split(sentence)) {
+                    voiceLatency.onAsrFinal(part)
                     if (stage != null) {
                         BenchLog.transcript("final_source kind=$kind src=\"$part\"")
                         stage.onFinal(part)
@@ -463,7 +471,7 @@ class SublySession internal constructor(
                 }
             }
 
-            asrEngine.transcribe(frames)
+            asrEngine.transcribe(frames.onEach(voiceLatency::onFrame))
                 .collect { asrResult ->
                     when (asrResult) {
                         is AsrResult.Partial -> {
@@ -474,8 +482,15 @@ class SublySession internal constructor(
                             // aren't split.
                             flushJob?.cancel()
                             val pending = extractorMutex.withLock { extractor.pending() }
+                            // Sentences the speaker has clearly finished go to
+                            // translation now, not at the recogniser's final.
+                            val utterance = cjkSpacing.collapse("$pending ${asrResult.text}".trim())
+                            for (sentence in earlyCommitter.onPartial(utterance)) {
+                                if (!isDuplicateFinal(sentence)) emitFinal(sentence, kind = "early")
+                            }
+                            val live = earlyCommitter.uncommitted(utterance).trim()
                             if (stage != null) {
-                                val hypothesis = "$pending ${cjkSpacing.collapse(asrResult.text)}".trim()
+                                val hypothesis = live
                                 if (hypothesis.isNotEmpty()) {
                                     stage.onPartial(hypothesis)
                                     send(
@@ -487,10 +502,8 @@ class SublySession internal constructor(
                                         )
                                     )
                                 }
-                            } else {
-                                processPartialResult(
-                                    pending, cjkSpacing.collapse(asrResult.text),
-                                )?.let { send(it) }
+                            } else if (live.isNotEmpty()) {
+                                processPartialResult("", live)?.let { send(it) }
                             }
                         }
 
@@ -510,6 +523,19 @@ class SublySession internal constructor(
                             flushJob?.cancel()
                             resetPartialThrottle()
 
+                            // Text pooled without a terminator is followed by a
+                            // capitalised final: it was a sentence after all,
+                            // whose full stop the recogniser left out ("…the
+                            // Mid East War" / "You may also…").
+                            val closed = extractorMutex.withLock {
+                                val pooled = extractor.pending()
+                                if (pooled.isNotEmpty() &&
+                                    pooled.last() !in SentenceExtractor.SENTENCE_TERMINATORS &&
+                                    asrEngine.capitalisesOnlySentenceStarts && startsNewSentence(spaced)
+                                ) extractor.drain() else null
+                            }
+                            if (closed != null && !isDuplicateFinal(closed)) emitFinal(terminate(closed), kind = "closed")
+
                             val sentences = extractorMutex.withLock {
                                 val startsSentence = extractor.pending().let {
                                     it.isEmpty() ||
@@ -521,7 +547,15 @@ class SublySession internal constructor(
                                     capitalise = startsSentence,
                                 ) ?: spaced.trim()
                                 if (finalChunk.isEmpty()) return@withLock emptyList()
-                                extractor.append(finalChunk)
+                                val utterance = cjkSpacing.collapse("${extractor.pending()} $finalChunk".trim())
+                                val remainder = earlyCommitter.onFinal(utterance)
+                                if (remainder === utterance) {
+                                    extractor.append(finalChunk)
+                                } else {
+                                    // Part of it was committed from partials.
+                                    extractor.drain()
+                                    extractor.append(remainder)
+                                }
                                 extractor.extractCompleted()
                             }
                             for (sentence in sentences) {
@@ -592,7 +626,11 @@ class SublySession internal constructor(
                 val error = e as? SublyError ?: SublyError.PipelineFailed(e)
                 _state.value = EngineState.Error(error)
             }
-            .collect { caption -> _captions.emit(caption) }
+            .onCompletion { voiceLatency.summary()?.let(BenchLog::metric) }
+            .collect { caption ->
+                voiceLatency.onCaption(caption)
+                _captions.emit(caption)
+            }
     }
 
     private fun incrementalTranslator(): IncrementalTranslator? =
@@ -606,9 +644,23 @@ class SublySession internal constructor(
             StageMetric.Kind.FORCED_COMMIT -> "waitk_forced_commit"
             StageMetric.Kind.FINAL_TTFT -> "translate_final_ttft"
             StageMetric.Kind.MERGED_FINALS -> "translate_merged_finals"
+            StageMetric.Kind.PREVIEW_TTFT -> "translate_preview_ttft"
+            StageMetric.Kind.PREVIEW_CANCELLED -> "translate_preview_cancelled"
         }
         BenchLog.metric("$name ms=${metric.ms} src_len=${metric.sourceChars}")
         _stageMetrics.tryEmit(metric)
+    }
+
+    /**
+     * Whether [text] opens a new sentence: its first letter is a capital in a
+     * cased script, other than the pronoun "I", which starts clauses too.
+     */
+    private fun startsNewSentence(text: String): Boolean {
+        val trimmed = text.trimStart { !it.isLetterOrDigit() }
+        val first = trimmed.firstOrNull() ?: return false
+        if (!first.isUpperCase()) return false
+        val word = trimmed.takeWhile { it.isLetterOrDigit() || it == '\'' }
+        return word != "I" && !word.startsWith("I'")
     }
 
     /**

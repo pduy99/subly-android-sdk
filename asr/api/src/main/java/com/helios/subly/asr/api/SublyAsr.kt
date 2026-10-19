@@ -27,6 +27,15 @@ interface SublyAsr {
     val emitsCompleteUtterances: Boolean get() = false
 
     /**
+     * Whether a capital at the start of a final means a new sentence. True
+     * for engines that case and punctuate their own output: when one leaves
+     * out a full stop, the capitalised final after it shows the sentence had
+     * ended. Engines that capitalise every chunk (whisper starts each window
+     * with a capital, mid-sentence or not) leave this `false`.
+     */
+    val capitalisesOnlySentenceStarts: Boolean get() = false
+
+    /**
      * Transcribes a stream of raw audio frames into ASR results.
      *
      * ### Contract

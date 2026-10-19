@@ -57,11 +57,20 @@ Full numbers and reasoning are in `docs/five-language-asr.md`.
 
 ## Translation
 
-- `LiteRtLmModel.canRunLargeModel(context)` is true at 10.5 GB total RAM or more. Then the app uses Qwen3-4B-Instruct-2507 (int4); otherwise ML Kit.
-- Measured on an 8 GB Galaxy S10: Qwen3-4B took about 10 s to the first token, Qwen2.5-1.5B translated wrongly or in the wrong language, and Qwen3-1.7B drifted and leaked reasoning (removed). So small devices use ML Kit.
+- `LiteRtLmModel.canRunLargeModel(context)` is true at 10.5 GB total RAM or more. Then the app uses Gemma 4 E2B (`GEMMA4_E2B_IT`, Apache-2.0), with ML Kit until it is loaded (`HandoverTranslator`); otherwise ML Kit alone.
+- Gemma 4 E2B replaced Qwen3-4B after measurement: equal or better chrF on FLEURS in 6 of 8 directions, 0.38 s instead of 2.2 s to the first token, and 1.6 s instead of 5.3 s per sentence on the S24 GPU. See `docs/realtime-translation.md`.
+- Hy-MT2-1.8B (Tencent's translation model) is in the catalog with its own prompt style (`PromptStyle.HY_MT`: no system prompt, one message per conversation). It is as accurate as Gemma but slower on the S24.
+- `HandoverTranslator` prepares both engines at once and is ready with whichever is ready first. ML Kit model downloads have been seen to hang with no error for over 20 minutes, and `MlKitTranslator` now gives up after 5.
 - Translator context (previous lines in the prompt) made small models copy lines, so it is off by default.
-- Translation drafts are off by default; they made end-of-sentence latency worse.
-- Stay on LiteRT-LM 0.16.1. 0.18 needs Kotlin 2.4 metadata and breaks Hilt in the app; it was tried and reverted.
+- Translation drafts (clause by clause) are off by default; they made end-of-sentence latency worse with Qwen3-4B and again with Gemma.
+- Stay on LiteRT-LM 0.16.1 for now. 0.18 needs Kotlin 2.4 metadata and broke Hilt in the app. Gemma 4's multi-token prediction needs a newer runtime, which is worth revisiting.
+
+## Real-time pipeline
+
+- `EarlyCommitter` commits a sentence from the partial hypothesis once it is complete, followed by speech, and unchanged for three partials. Fast dialogue rarely pauses, so waiting for the recogniser's final delayed lines by up to 10 s.
+- `StreamingTranslationStage` with `livePreview` (default on) translates the sentence being spoken whenever the translator is idle, and cancels the preview the moment committed work arrives.
+- `VoiceLatencyTracker` logs `sentence_latency` per caption to `SublyBench`: speech start -> first text / first translation, speech end -> commit -> caption. Read it with `benchmark/tools/voice_latency_report.py`.
+- `SherpaOnnxModel.punctuates` (the Kroko models): a final without a terminator was cut by a pause, so it is joined with the next one, unless the next starts with a capital (`SublyAsr.capitalisesOnlySentenceStarts`).
 
 ## Build and test
 
@@ -82,9 +91,9 @@ When more than one device is connected, pass `ANDROID_SERIAL`.
 - Always pass `-Pandroid.injected.androidTest.leaveApksInstalledAfterRun=true`. Otherwise Gradle uninstalls the test APK (`com.helios.subly.benchmark.test`) and deletes gigabytes of downloaded models.
 - Transcripts are logged only with `adb shell setprop log.tag.SublyBench VERBOSE`. Never log transcript content at other levels: it is end-user speech.
 - Pick tests with `-Pandroid.testInstrumentationRunnerArguments.class=...` and pass test arguments the same way.
-- `latency/AsrProbeTest` compares recognisers: CER for zh/ja, WER for en/es/vi, plus RTF, init time and download size. Narrow a run with `probeLanguages` (for example `ja,vi`) and `probeAsr` (candidate names). Output goes to logcat tag `AsrProbe` and to `asr_probe.json`.
+- `latency/AsrProbeTest` compares recognisers: CER for zh/ja, WER for en/es/vi, plus RTF, init time and download size. Narrow a run with `probeLanguages` (for example `ja,vi`) and `probeAsr` (candidate names); `probeClips` (up to 5), `probeVadSilence` and `probeVadMax` tune offline segmentation. Output goes to logcat tag `AsrProbe` and to `asr_probe.json`.
 - `latency/StreamingLatencyBenchmarkTest` runs the full pipeline. Arguments: `latencyAsr` (`vosk|whisper|sherpa|sensevoice|auto`), `latencyClips`, `latencyTarget`, `latencyTranslator` (`mlkit` or a `LiteRtLmModel` name). `benchmark/tools/latency_report.py` prints the newest `latency.json`.
-- `latency/TranslatorModelProbeTest` compares translators (`probeModels`, including `MLKIT` and `MLKIT_PIVOT_EN`).
+- `latency/TranslatorModelProbeTest` compares translators (`probeModels`, including `MLKIT` and `MLKIT_PIVOT_EN`). `probeSamples=flores` uses FLEURS sentences with references in every direction (`probeDirections`, `probeLimit`); score with `benchmark/tools/translator_probe_report.py` (chrF and speed). In the test app, ML Kit downloads can hang; leave `MLKIT` out unless its models are already there.
 - The dataset is under `benchmark/src/androidTest/assets/dataset/` (FLEURS clips for en, zh, ja, es, vi with references, listed in `manifest.json`). `realworld/zh_dialogue_01` is fast real-world Mandarin dialogue.
 - After about an hour of continuous GPU runs the S24 throttles (thermal status 3), so compare only runs done back to back.
 

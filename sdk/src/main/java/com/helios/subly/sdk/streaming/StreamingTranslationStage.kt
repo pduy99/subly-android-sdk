@@ -4,6 +4,10 @@ import android.util.Log
 import com.helios.subly.translator.api.IncrementalTranslator
 import com.helios.subly.translator.api.TranslationSegment
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -63,6 +67,12 @@ data class StageMetric(val kind: Kind, val ms: Long, val sourceChars: Int) {
          * number merged.
          */
         MERGED_FINALS,
+
+        /** A live preview's first token: [StageMetric.ms] from its start. */
+        PREVIEW_TTFT,
+
+        /** A live preview was cancelled because committed work arrived. */
+        PREVIEW_CANCELLED,
     }
 }
 
@@ -81,10 +91,18 @@ data class StageMetric(val kind: Kind, val ms: Long, val sourceChars: Int) {
  * starts, so falling behind costs fewer, larger appends rather than an
  * ever-growing backlog: the queue holds at most one pending piece per
  * sentence plus the sentence's final.
+ *
+ * With [livePreview], the worker uses the time it would otherwise sit idle:
+ * it translates the sentence still being spoken, as a whole, and shows that
+ * as the live translation, so a long sentence is translated while it is
+ * spoken rather than only after it ends. A preview is throwaway: it is
+ * cancelled the moment committed work arrives, and the sentence's final
+ * translation replaces it.
  */
 class StreamingTranslationStage(
     private val translator: IncrementalTranslator,
     private val policy: WaitKPolicy,
+    private val livePreview: Boolean = false,
     private val onState: suspend (TranslationState) -> Unit = {},
     private val onMetric: (StageMetric) -> Unit = {},
     private val nanoTime: () -> Long = System::nanoTime,
@@ -133,6 +151,20 @@ class StreamingTranslationStage(
 
     private var segment: TranslationSegment? = null
 
+    /** Latest hypothesis of the sentence being spoken, for previews. */
+    private var previewSource = ""
+    private var previewSourceSentenceId = -1L
+
+    /** What the last preview translated, and for which sentence. */
+    private var previewedSource = ""
+    private var previewedSentenceId = -1L
+
+    /** The current sentence's preview translation; empty when stale or none. */
+    @Volatile
+    private var previewTranslation = ""
+    @Volatile
+    private var previewTranslationSentenceId = -1L
+
     /** A piece of the worker's sentence failed, so its segment is incomplete. */
     private var pieceFailed = false
 
@@ -148,7 +180,11 @@ class StreamingTranslationStage(
      * the worker is still busy with an earlier sentence.
      */
     fun translationForCurrentSentence(): String = synchronized(lock) {
-        if (workerSentenceId == inputSentenceId) workerTranslation else ""
+        when {
+            workerSentenceId == inputSentenceId && workerTranslation.isNotEmpty() -> workerTranslation
+            previewTranslationSentenceId == inputSentenceId -> previewTranslation
+            else -> ""
+        }
     }
 
     /** Feeds the latest hypothesis of the sentence being spoken. Never blocks. */
@@ -156,8 +192,14 @@ class StreamingTranslationStage(
         synchronized(lock) {
             if (finished) return
             liveSentenceId = inputSentenceId
+            previewSource = hypothesis
+            previewSourceSentenceId = inputSentenceId
             val forcedBefore = buffer.forcedCommits
-            val delta = buffer.onPartial(hypothesis) ?: return
+            val delta = buffer.onPartial(hypothesis) ?: run {
+                // Nothing to commit, but an idle worker may preview it.
+                if (livePreview) wakeUp.trySend(Unit)
+                return
+            }
             queue.addLast(Commit(delta, hypothesis, inputSentenceId, nanoTime()))
             if (buffer.forcedCommits > forcedBefore) {
                 onMetric(StageMetric(StageMetric.Kind.FORCED_COMMIT, 0, delta.length))
@@ -173,6 +215,7 @@ class StreamingTranslationStage(
             if (finished) return
             queue.addLast(Final(sentence, buffer.onFinal(sentence), inputSentenceId, nanoTime()))
             inputSentenceId++
+            previewSource = ""
         }
         wakeUp.trySend(Unit)
     }
@@ -194,6 +237,11 @@ class StreamingTranslationStage(
                 val work = synchronized(lock) { nextWork() }
                 if (work == null) {
                     if (synchronized(lock) { finished && queue.isEmpty() }) return
+                    val preview = synchronized(lock) { nextPreview() }
+                    if (preview != null) {
+                        runPreview(preview)
+                        continue
+                    }
                     wakeUp.receive()
                     continue
                 }
@@ -281,6 +329,75 @@ class StreamingTranslationStage(
         return script == Character.UnicodeScript.HAN || script == Character.UnicodeScript.HIRAGANA ||
             script == Character.UnicodeScript.KATAKANA || script == Character.UnicodeScript.THAI ||
             ch in "。！？，、；：…"
+    }
+
+    private data class Preview(val source: String, val sentenceId: Long)
+
+    /**
+     * The sentence being spoken, when it has grown enough since its last
+     * preview to be worth translating again; null otherwise.
+     */
+    private fun nextPreview(): Preview? {
+        if (!livePreview || finished) return null
+        val source = previewSource
+        val id = previewSourceSentenceId
+        if (id != inputSentenceId || source.isBlank()) return null
+        val letters = source.count { it.isLetterOrDigit() }
+        if (letters < PREVIEW_MIN_CHARS) return null
+        if (id == previewedSentenceId &&
+            letters - previewedSource.count { it.isLetterOrDigit() } < PREVIEW_MIN_GROWTH
+        ) return null
+        previewedSource = source
+        previewedSentenceId = id
+        return Preview(source, id)
+    }
+
+    /**
+     * Translates [preview] as a throwaway segment, publishing it as the live
+     * translation, until it finishes or committed work arrives.
+     */
+    private suspend fun runPreview(preview: Preview) = coroutineScope {
+        val startedAt = nanoTime()
+        val job = launch {
+            try {
+                translator.openSegment().use { seg ->
+                    var first = true
+                    seg.append(preview.source).collect { text ->
+                        if (first) {
+                            first = false
+                            onMetric(StageMetric(StageMetric.Kind.PREVIEW_TTFT, elapsedMs(startedAt), preview.source.length))
+                        }
+                        val current = synchronized(lock) {
+                            if (preview.sentenceId == inputSentenceId) {
+                                previewTranslation = text
+                                previewTranslationSentenceId = preview.sentenceId
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        if (current) publish(TranslationState.Partial(preview.source, text, stableLength = 0))
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Live preview failed; the final will translate the sentence", e)
+            }
+        }
+        while (job.isActive) {
+            select<Unit> {
+                job.onJoin {}
+                wakeUp.onReceive {
+                    if (synchronized(lock) { queue.isNotEmpty() || finished }) {
+                        onMetric(StageMetric(StageMetric.Kind.PREVIEW_CANCELLED, elapsedMs(startedAt), preview.source.length))
+                        job.cancelAndJoin()
+                    }
+                }
+            }
+        }
+        // A wake-up consumed above may have been for new work: look again.
+        wakeUp.trySend(Unit)
     }
 
     /** Earliest enqueue time of commits folded into a final, for its TTFT. */
@@ -411,5 +528,15 @@ class StreamingTranslationStage(
          * that one generation stays a couple of seconds.
          */
         const val MERGE_MAX_CHARS = 60
+
+        /** A sentence this short is not worth a preview: its final comes soon. */
+        const val PREVIEW_MIN_CHARS = 6
+
+        /**
+         * Letters a sentence must grow by before it is previewed again:
+         * about a word in English, a few characters in Chinese. Bounds
+         * re-translation to what changes the meaning.
+         */
+        const val PREVIEW_MIN_GROWTH = 4
     }
 }

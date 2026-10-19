@@ -70,6 +70,28 @@ internal object TranslationPrompt {
     }
 
     /**
+     * The whole request for a Hunyuan-MT model ([LiteRtLmModel.PromptStyle.HY_MT]),
+     * which has no system prompt: its documented default-translation prompt,
+     * in Chinese when either side is Chinese, as its authors recommend.
+     */
+    fun hyMtMessage(text: String, sourceTag: String, targetTag: String): String {
+        val chinese = sourceTag.substringBefore('-') == "zh" || targetTag.substringBefore('-') == "zh"
+        return if (chinese) {
+            "将以下文本翻译为${chineseLanguageName(targetTag)}，注意只需要输出翻译后的结果，不要额外解释：\n\n$text"
+        } else {
+            "Translate the following text into ${languageName(targetTag)}. Note that you should only " +
+                "output the translated result without any additional explanation:\n\n$text"
+        }
+    }
+
+    /** Chinese display name for a BCP-47 tag, e.g. `vi` -> `越南语`. */
+    fun chineseLanguageName(tag: String): String {
+        val locale = Locale.forLanguageTag(tag)
+        val name = locale.getDisplayLanguage(Locale.SIMPLIFIED_CHINESE)
+        return if (name.isBlank() || name.equals(tag, ignoreCase = true)) languageName(tag) else name
+    }
+
+    /**
      * English display name for a BCP-47 tag, e.g. `vi` -> `Vietnamese`.
      *
      * Uses the platform's own tables rather than a hand-written map, so
