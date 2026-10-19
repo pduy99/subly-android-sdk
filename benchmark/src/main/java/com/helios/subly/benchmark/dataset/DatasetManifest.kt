@@ -93,6 +93,8 @@ data class DatasetManifest(val clips: List<Clip> = emptyList()) {
             "en" to setOf("vi"),
             "zh" to setOf("vi", "en"),
             "ja" to setOf("vi", "en"),
+            "es" to setOf("vi", "en"),
+            "vi" to setOf("en"),
         )
 
         fun parse(json: String): DatasetManifest =
