@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- whisper.cpp's OpenCL backend reaches the vendor driver through
+             dlopen (see tools/gen_opencl_shim.py). Android 12+ only lets an
+             app load a vendor public library it declares; optional, so
+             phones without OpenCL install fine and transcribe on the CPU. -->
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+    </application>
+
+</manifest>

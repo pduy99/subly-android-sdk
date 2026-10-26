@@ -1,0 +1,937 @@
+package com.helios.subly.sdk
+
+import android.media.projection.MediaProjection
+import androidx.annotation.VisibleForTesting
+import com.helios.subly.asr.api.SublyAsr
+import com.helios.subly.audio.api.AudioCapture
+import com.helios.subly.audio.api.ProjectionlessAudioCapture
+import com.helios.subly.core.model.AsrResult
+import com.helios.subly.core.model.AudioFrame
+import com.helios.subly.core.model.Caption
+import com.helios.subly.core.model.EngineState
+import com.helios.subly.core.model.LanguageConfig
+import com.helios.subly.core.model.ModelPrepState
+import com.helios.subly.core.model.SublyError
+import com.helios.subly.translator.api.SublyTranslator
+import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.transformWhile
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Locale
+import com.helios.subly.core.model.AccelerationAware
+import com.helios.subly.core.model.AccelerationReport
+import com.helios.subly.sdk.streaming.StageMetric
+import com.helios.subly.sdk.streaming.StreamingTranslationStage
+import com.helios.subly.sdk.streaming.TranslationState
+import com.helios.subly.sdk.streaming.WaitKPolicy
+import com.helios.subly.translator.api.IncrementalTranslator
+import kotlin.time.Duration.Companion.milliseconds
+
+/**
+ * A stateful captioning session for one language pair.
+ *
+ * ## Lifecycle
+ * ```kotlin
+ * val session = subly.createSession(config)
+ * session.prepare()                 // optional pre-warm (start() triggers it too)
+ * session.start(mediaProjection)    // Preparing → Ready → Running
+ * session.stop()                    // back to Ready; models stay warm
+ * session.close()                   // releases engines; session is dead
+ * ```
+ *
+ * ## Observing
+ * - [state] — lifecycle only (Idle / Preparing / Ready / Running / Error /
+ *   Closed). Drive loading spinners, status copy, and error UI from this.
+ * - [captions] — the caption stream. Partials may be conflated under
+ *   pressure; finals are buffered and never silently dropped while a
+ *   collector is active. Late collectors replay the most recent caption.
+ *
+ * After an [EngineState.Error] during preparation, calling [prepare] (or
+ * [start]) again retries. Errors during a running pipeline stop the pipeline
+ * and surface on [state]; call [start] again to retry.
+ *
+ * Construction is cheap and side-effect free — no I/O happens until
+ * [prepare] or [start].
+ */
+class SublySession internal constructor(
+    initialConfig: LanguageConfig,
+    private val audioCapture: AudioCapture,
+    private val asrEngine: SublyAsr,
+    private val translationEngine: SublyTranslator,
+    private val restorePunctuation: Boolean = true,
+    private val translationDrafts: Boolean = false,
+    private val livePreview: Boolean = true,
+) : AutoCloseable {
+
+    /** Current language pair; replaced by [setLanguages]. */
+    @Volatile
+    private var config: LanguageConfig = initialConfig
+
+    /** The language pair this session prepares and captions for. */
+    val languages: LanguageConfig get() = config
+
+    /** Null when disabled — ASR text then reaches the extractor untouched. */
+    private var punctuation: PunctuationRestorer? = punctuationFor(initialConfig)
+
+    // Independent of restorePunctuation: an inter-word space in Chinese or
+    // Japanese is a recogniser artefact either way, not a formatting choice.
+    private var cjkSpacing = CjkSpacing(initialConfig.source)
+
+    private var cjkSplitter = CjkSentenceSplitter(initialConfig.source)
+
+    private fun punctuationFor(config: LanguageConfig): PunctuationRestorer? =
+        if (restorePunctuation) PunctuationRestorer(config.source) else null
+
+    private val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val _state = MutableStateFlow<EngineState>(EngineState.Idle)
+    val state: StateFlow<EngineState> = _state.asStateFlow()
+
+    private val _captions = MutableSharedFlow<Caption>(
+        replay = 1,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.SUSPEND,
+    )
+    val captions: SharedFlow<Caption> = _captions.asSharedFlow()
+
+    private var prepJob: Job? = null
+    private var pipelineJob: Job? = null
+
+    private val _translationState = MutableStateFlow<TranslationState>(TranslationState.Idle)
+
+    /**
+     * Live translation of the sentence being spoken, for engines translated
+     * incrementally (see [IncrementalTranslator]). Unlike [captions] it is a
+     * state, not an event stream: collectors see the latest value only, and
+     * it stays [TranslationState.Idle] for engines that translate finals in
+     * one call.
+     */
+    val translationState: StateFlow<TranslationState> = _translationState.asStateFlow()
+
+    private val _stageMetrics = MutableSharedFlow<StageMetric>(
+        extraBufferCapacity = 256,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
+     * Timings from the incremental translation stage, as they happen: time to
+     * first token, per-piece latency, and ASR-final-to-translation latency.
+     * Hot and lossy under pressure (oldest dropped): for diagnostics and
+     * benchmarks, not for logic.
+     */
+    val stageMetrics: SharedFlow<StageMetric> = _stageMetrics.asSharedFlow()
+
+    /**
+     * Compute delegates the engines ended up on, for engines that report one.
+     * Empty until preparation has finished.
+     */
+    fun accelerationReports(): List<AccelerationReport> =
+        listOf(asrEngine, translationEngine).mapNotNull { (it as? AccelerationAware)?.accelerationReport }
+
+    /**
+     * Starts (or retries) model preparation. Idempotent: no-ops while
+     * preparation is in flight or already complete.
+     *
+     * @throws IllegalStateException if the session is [EngineState.Closed].
+     */
+    @Synchronized
+    fun prepare() {
+        checkNotClosed()
+        if (prepJob?.isActive == true) return
+        when (_state.value) {
+            is EngineState.Ready, is EngineState.Running -> return
+            else -> Unit // Idle or Error → (re)run
+        }
+        prepJob = sessionScope.launch { runPreparation() }
+    }
+
+    /**
+     * Starts the capture → ASR → translation pipeline. Triggers [prepare] if
+     * needed and waits for it; if preparation fails, the failure surfaces on
+     * [state] and the pipeline does not start.
+     *
+     * Idempotent while the pipeline is running.
+     *
+     * @throws IllegalStateException if the session is [EngineState.Closed].
+     */
+    @Synchronized
+    fun start(mediaProjection: MediaProjection) {
+        startWith { audioCapture.frames(mediaProjection) }
+    }
+
+    /**
+     * Starts the pipeline without a `MediaProjection` token. Only valid when
+     * the installed capture is a [ProjectionlessAudioCapture] (file decoders,
+     * fakes) — the default system-audio capture is not.
+     *
+     * Same semantics as [start] otherwise.
+     *
+     * @throws IllegalStateException if the session is closed, or if the
+     *   installed [AudioCapture] requires a projection token.
+     */
+    @VisibleForTesting
+    @Synchronized
+    fun start() {
+        val capture = audioCapture as? ProjectionlessAudioCapture ?: throw IllegalStateException(
+            "The installed AudioCapture requires a MediaProjection — call " +
+                "start(mediaProjection), or install a ProjectionlessAudioCapture " +
+                "via Subly.Builder.setAudioCapture { ... }."
+        )
+        startWith { capture.frames() }
+    }
+
+    private fun startWith(frames: () -> Flow<AudioFrame>) {
+        checkNotClosed()
+        if (pipelineJob?.isActive == true) return
+        prepare()
+
+        pipelineJob = sessionScope.launch {
+            prepJob?.join()
+            if (_state.value !is EngineState.Ready) return@launch // error already on [state]
+
+            _state.value = EngineState.Running
+            runPipeline(frames())
+        }
+    }
+
+    /**
+     * Switches the language pair without giving up the engines.
+     *
+     * Preparation runs again against the same engine instances, and each
+     * engine only redoes what the new pair actually needs: the LLM translator
+     * and Whisper keep their loaded models (one is pair-agnostic, the other
+     * multilingual) and just change parameters; Vosk swaps to the new
+     * language's model, releasing the old one first. Compared with closing
+     * the session and creating another, this skips a translator init that
+     * takes 10-30 s and briefly holding two sets of engines.
+     *
+     * A running pipeline is stopped (its sentence assembly is per language);
+     * call [start] again once [state] is [EngineState.Ready]. Same pair as
+     * now: equivalent to [prepare].
+     *
+     * @throws IllegalStateException if the session is [EngineState.Closed].
+     */
+    @Synchronized
+    fun setLanguages(newConfig: LanguageConfig) {
+        checkNotClosed()
+        if (newConfig == config) {
+            prepare()
+            return
+        }
+        val previousPipeline = pipelineJob?.also { it.cancel() }
+        val previousPrep = prepJob?.also { it.cancel() }
+        pipelineJob = null
+        config = newConfig
+        punctuation = punctuationFor(newConfig)
+        cjkSpacing = CjkSpacing(newConfig.source)
+        cjkSplitter = CjkSentenceSplitter(newConfig.source)
+        _translationState.value = TranslationState.Idle
+        _state.value = EngineState.Idle
+        // Cancellation is cooperative: wait for the old work to unwind so
+        // two prepareModel calls never race on the same engine (Vosk freeing
+        // one model while loading another).
+        prepJob = sessionScope.launch {
+            previousPipeline?.join()
+            previousPrep?.join()
+            runPreparation()
+        }
+    }
+
+    /**
+     * Stops the pipeline but keeps models warm — [state] returns to
+     * [EngineState.Ready] and [start] can be called again without re-preparing.
+     */
+    @Synchronized
+    fun stop() {
+        pipelineJob?.cancel()
+        pipelineJob = null
+        if (_state.value is EngineState.Running) {
+            _state.value = EngineState.Ready
+        }
+    }
+
+    /**
+     * Releases the session's engines and cancels all work. Terminal and
+     * idempotent. The session cannot be reused — create a new one via
+     * [Subly.createSession].
+     */
+    @Synchronized
+    override fun close() {
+        if (_state.value is EngineState.Closed) return
+        _state.value = EngineState.Closed
+        sessionScope.cancel()
+        // This session owns its engines (created per-session by Subly's
+        // factories), so releasing here cannot affect other sessions.
+        asrEngine.release()
+        translationEngine.release()
+    }
+
+    // -------------------------------------------------------------------------
+    // Preparation
+    // -------------------------------------------------------------------------
+
+    private suspend fun runPreparation() {
+        var reachedReady = false
+
+        // One engine after the other, not both at once. Each engine's init
+        // peak (weights memory-mapped while being uploaded to the GPU, kernel
+        // compilation) is its largest allocation, and overlapping a 4B LLM's
+        // with whisper's got the app killed by the low-memory killer on a
+        // 12 GB phone. Costs first-run time: the translator's download no
+        // longer overlaps the recogniser's.
+        flow {
+            var asrLast: ModelPrepState = ModelPrepState.Checking
+            asrEngine.prepareModel(config)
+                .transformWhile { emit(it); it !is ModelPrepState.Ready && it !is ModelPrepState.Error }
+                .collect { asrLast = it; emit(it to ModelPrepState.Checking) }
+            if (asrLast is ModelPrepState.Ready) {
+                translationEngine.prepareModel(config).collect { emit(ModelPrepState.Ready to it) }
+            }
+        }
+            .transformWhile { pair ->
+                emit(pair)
+                val (asr, trans) = pair
+                val isTerminal =
+                    (asr is ModelPrepState.Ready && trans is ModelPrepState.Ready) || (asr is ModelPrepState.Error) || (trans is ModelPrepState.Error)
+
+                !isTerminal
+            }
+            // Engines must not throw per contract, but a misbehaving engine
+            // shouldn't take the session down with an unhandled exception.
+            .catch { e ->
+                if (e is CancellationException) throw e
+                _state.value = EngineState.Error(
+                    SublyError.ModelPreparationFailed(component = null, cause = e)
+                )
+            }
+            .collect { (asr, trans) ->
+                when {
+                    asr is ModelPrepState.Error -> _state.value = EngineState.Error(
+                        SublyError.ModelPreparationFailed(SublyError.Component.ASR, asr.cause)
+                    )
+
+                    trans is ModelPrepState.Error -> _state.value = EngineState.Error(
+                        SublyError.ModelPreparationFailed(
+                            SublyError.Component.TRANSLATOR,
+                            trans.cause
+                        )
+                    )
+
+                    asr is ModelPrepState.Ready && trans is ModelPrepState.Ready -> {
+                        // ML Kit's first translate() pays one-off lazy-init
+                        // costs (~500 ms observed). Absorb it here, behind the
+                        // prepare progress, instead of on the first caption.
+                        warmUpTranslator()
+                        reachedReady = true
+                        _state.value = EngineState.Ready
+                    }
+
+                    else -> _state.value = EngineState.Preparing(
+                        asrState = asr,
+                        translatorState = trans,
+                        progress = overallProgress(asr, trans),
+                    )
+                }
+            }
+
+        // Defensive: an engine completed its prepare flow without a terminal
+        // emission (contract violation). The old behavior here reported
+        // Ready, which presented as "ready but captions never appear" —
+        // fail loudly instead.
+        if (!reachedReady && _state.value !is EngineState.Error && _state.value !is EngineState.Closed) {
+            _state.value = EngineState.Error(
+                SublyError.ModelPreparationFailed(
+                    component = null,
+                    cause = IllegalStateException(
+                        "An engine's prepareModel flow completed without emitting Ready or Error."
+                    ),
+                )
+            )
+        }
+    }
+
+    /** Non-fatal: a failed warm-up just means the first caption pays it. */
+    private suspend fun warmUpTranslator() {
+        val startNanos = System.nanoTime()
+        try {
+            // Bounded because "warm-up" is only worth doing if it is shorter
+            // than the thing it is warming. ML Kit's lazy init is ~500 ms; an
+            // LLM's first generation is tens of seconds and genuinely belongs
+            // here, behind the progress bar. Anything past the cap is not a
+            // warm-up, it is a hang, and prepare() should finish without it.
+            val warmed =
+                withTimeoutOrNull(WARM_UP_TIMEOUT_MS.milliseconds) { translationEngine.translate("Hello.") }
+            BenchLog.metric(
+                "translate_warmup ms=${(System.nanoTime() - startNanos) / 1_000_000} " +
+                    "ok=${warmed != null}"
+            )
+            if (warmed == null) {
+                Log.w(TAG, "Translator warm-up timed out after ${WARM_UP_TIMEOUT_MS}ms (non-fatal)")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            BenchLog.metric(
+                "translate_warmup ms=${(System.nanoTime() - startNanos) / 1_000_000} ok=false"
+            )
+            Log.w(TAG, "Translator warm-up failed (non-fatal)", e)
+        }
+    }
+
+    private fun overallProgress(asr: ModelPrepState, trans: ModelPrepState): Float {
+        fun ModelPrepState.fraction(): Float = when (this) {
+            ModelPrepState.Checking -> 0f
+            is ModelPrepState.Preparing -> progress.coerceIn(0f, 1f)
+            ModelPrepState.Ready -> 1f
+            is ModelPrepState.Error -> 0f
+        }
+        return (asr.fraction() + trans.fraction()) / 2f
+    }
+
+    // -------------------------------------------------------------------------
+    // Pipeline
+    // -------------------------------------------------------------------------
+
+    private suspend fun runPipeline(frames: Flow<AudioFrame>) {
+        val extractor = SentenceExtractor(Locale.forLanguageTag(config.source))
+        val extractorMutex = Mutex()
+        val earlyCommitter = EarlyCommitter(Locale.forLanguageTag(config.source))
+        resetPartialThrottle()
+        lastFinalOriginal = ""
+        _translationState.value = TranslationState.Idle
+        // Caption timing against the voice, for `adb logcat -s SublyBench`.
+        val voiceLatency = VoiceLatencyTracker(log = BenchLog::metric)
+
+        channelFlow {
+            var flushJob: Job? = null
+
+            // LLM-class translators are too slow to translate inline, on the
+            // coroutine collecting ASR results: every call back-pressures the
+            // recogniser and audio capture. They get a stage of their own that
+            // translates committed clauses as they settle and never blocks
+            // this collector.
+            val stage = incrementalTranslator()?.let { translator ->
+                StreamingTranslationStage(
+                    translator = translator,
+                    policy = WaitKPolicy.forLanguage(config.source).copy(drafts = translationDrafts),
+                    livePreview = livePreview,
+                    onState = { state ->
+                        _translationState.value = state
+                        when (state) {
+                            is TranslationState.Partial -> send(
+                                Caption(state.source, state.text, isFinal = false, mode = Caption.CaptureMode.AUDIO)
+                            )
+                            is TranslationState.Finalized -> {
+                                // Content for accuracy evaluation; no-op unless VERBOSE opted in.
+                                BenchLog.transcript("translate_text kind=final src=\"${state.source}\" dst=\"${state.text}\"")
+                                send(Caption(state.source, state.text, isFinal = true, mode = Caption.CaptureMode.AUDIO))
+                            }
+                            is TranslationState.Failed -> throw SublyError.TranslationFailed(state.error)
+                            TranslationState.Idle -> Unit
+                        }
+                    },
+                    onMetric = ::logStageMetric,
+                )
+            }
+            val stageWorker = stage?.let { launch { it.run() } }
+
+            // Finals go through the stage when there is one, so they reuse the
+            // clauses it already translated; otherwise they are translated here.
+            suspend fun emitFinal(sentence: String, kind: String) {
+                for (part in cjkSplitter.split(sentence)) {
+                    voiceLatency.onAsrFinal(part)
+                    if (stage != null) {
+                        BenchLog.transcript("final_source kind=$kind src=\"$part\"")
+                        stage.onFinal(part)
+                    } else {
+                        send(buildFinalCaption(part, kind))
+                    }
+                }
+            }
+
+            asrEngine.transcribe(frames.onEach(voiceLatency::onFrame))
+                .collect { asrResult ->
+                    when (asrResult) {
+                        is AsrResult.Partial -> {
+                            // Speaker is mid-utterance: a Final for this
+                            // segment is coming, and the pooled remainder may
+                            // be the start of the sentence being spoken —
+                            // hold the idle flush so cross-segment sentences
+                            // aren't split.
+                            flushJob?.cancel()
+                            val pending = extractorMutex.withLock { extractor.pending() }
+                            // Sentences the speaker has clearly finished go to
+                            // translation now, not at the recogniser's final.
+                            val utterance = cjkSpacing.collapse("$pending ${asrResult.text}".trim())
+                            for (sentence in earlyCommitter.onPartial(utterance)) {
+                                if (!isDuplicateFinal(sentence)) emitFinal(sentence, kind = "early")
+                            }
+                            val live = earlyCommitter.uncommitted(utterance).trim()
+                            if (stage != null) {
+                                val hypothesis = live
+                                if (hypothesis.isNotEmpty()) {
+                                    stage.onPartial(hypothesis)
+                                    send(
+                                        Caption(
+                                            originalText = hypothesis,
+                                            translatedText = stage.translationForCurrentSentence(),
+                                            isFinal = false,
+                                            mode = Caption.CaptureMode.AUDIO,
+                                        )
+                                    )
+                                }
+                            } else if (live.isNotEmpty()) {
+                                processPartialResult("", live)?.let { send(it) }
+                            }
+                        }
+
+                        is AsrResult.Final -> {
+                            // Restore before pooling: the extractor splits on
+                            // terminators, so punctuating here is what lets it
+                            // break at sentences instead of at endpoints. Both
+                            // halves of that are conditional, for reasons the
+                            // captions make obvious when they are not:
+                            //  - a terminator on a window the length cap cut
+                            //    mid-utterance splits the caption mid-clause,
+                            //  - a capital on text that continues a pooled
+                            //    sentence reads as "with clean wet Hands
+                            //    squeeze them into a ball".
+                            val spaced = cjkSpacing.collapse(asrResult.text)
+
+                            flushJob?.cancel()
+                            resetPartialThrottle()
+
+                            // Text pooled without a terminator is followed by a
+                            // capitalised final: it was a sentence after all,
+                            // whose full stop the recogniser left out ("…the
+                            // Mid East War" / "You may also…").
+                            val closed = extractorMutex.withLock {
+                                val pooled = extractor.pending()
+                                if (pooled.isNotEmpty() &&
+                                    pooled.last() !in SentenceExtractor.SENTENCE_TERMINATORS &&
+                                    asrEngine.capitalisesOnlySentenceStarts && startsNewSentence(spaced)
+                                ) extractor.drain() else null
+                            }
+                            if (closed != null && !isDuplicateFinal(closed)) emitFinal(terminate(closed), kind = "closed")
+
+                            val sentences = extractorMutex.withLock {
+                                val startsSentence = extractor.pending().let {
+                                    it.isEmpty() ||
+                                        it.last() in SentenceExtractor.SENTENCE_TERMINATORS
+                                }
+                                val finalChunk = punctuation?.restore(
+                                    spaced,
+                                    addTerminator = asrResult.endsSentence,
+                                    capitalise = startsSentence,
+                                ) ?: spaced.trim()
+                                if (finalChunk.isEmpty()) return@withLock emptyList()
+                                val utterance = cjkSpacing.collapse("${extractor.pending()} $finalChunk".trim())
+                                val remainder = earlyCommitter.onFinal(utterance)
+                                if (remainder === utterance) {
+                                    extractor.append(finalChunk)
+                                } else {
+                                    // Part of it was committed from partials.
+                                    extractor.drain()
+                                    extractor.append(remainder)
+                                }
+                                extractor.extractCompleted()
+                            }
+                            for (sentence in sentences) {
+                                if (isDuplicateFinal(sentence)) continue
+                                emitFinal(sentence, kind = "final")
+                            }
+
+                            // Idle flush: if no further ASR final arrives to
+                            // complete the pooled remainder, it's the best
+                            // sentence we'll ever get — emit it rather than
+                            // stranding it (whisper finals frequently lack
+                            // terminal punctuation).
+                            //
+                            // How long to wait depends on what the recogniser
+                            // just told us. After a final that ended a
+                            // sentence, silence means the speaker stopped. But
+                            // after one cut at the length cap the continuation
+                            // is already coming, and whisper's finals arrive a
+                            // median 4.2 s apart on this hardware — so a 3 s
+                            // timer fires first 76% of the time and emits half
+                            // a sentence as its own caption. That, not the
+                            // punctuation, was what kept whisper at 1.76
+                            // captions per reference sentence while the
+                            // streaming engines sat at 1.00.
+                            val idleMs =
+                                if (asrResult.endsSentence) IDLE_FLUSH_MS
+                                else CONTINUATION_FLUSH_MS
+                            if (extractorMutex.withLock { !extractor.isEmpty }) {
+                                flushJob = launch {
+                                    delay(idleMs)
+                                    val remainder = extractorMutex.withLock { extractor.drain() }
+                                    if (remainder.isNotEmpty() && !isDuplicateFinal(remainder)) {
+                                        BenchLog.metric("sentence_flush len=${remainder.length}")
+                                        // Nothing more is coming for this
+                                        // sentence, so it does end here —
+                                        // terminate it rather than shipping a
+                                        // caption that trails off unpunctuated.
+                                        emitFinal(terminate(remainder), kind = "flush")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+            // End of audio. The idle flush above is a 3 s timer, so it only
+            // rescues the pooled remainder when the speaker happens to fall
+            // silent for 3 s before the stream ends — otherwise the block
+            // below returns, the channel closes, and the tail is dropped.
+            // With engines that emit no terminators (sherpa, vosk) the pool
+            // is non-empty almost every time, so this was silently losing the
+            // last caption of most sessions: on a 65 s benchmark clip it cost
+            // the final 268 characters, a third of a minute of speech.
+            flushJob?.cancel()
+            val tail = extractorMutex.withLock { extractor.drain() }
+            if (tail.isNotEmpty() && !isDuplicateFinal(tail)) {
+                BenchLog.metric("sentence_flush_eos len=${tail.length}")
+                emitFinal(terminate(tail), kind = "flush")
+            }
+
+            // Let the stage translate everything already heard before the
+            // stream completes; dropping it would lose the last captions.
+            stage?.finish()
+            stageWorker?.join()
+        }
+            .catch { e ->
+                if (e is CancellationException) throw e
+                val error = e as? SublyError ?: SublyError.PipelineFailed(e)
+                _state.value = EngineState.Error(error)
+            }
+            .onCompletion { voiceLatency.summary()?.let(BenchLog::metric) }
+            .collect { caption ->
+                voiceLatency.onCaption(caption)
+                _captions.emit(caption)
+            }
+    }
+
+    private fun incrementalTranslator(): IncrementalTranslator? =
+        (translationEngine as? IncrementalTranslator)?.takeIf { !translationEngine.translatesPartials }
+
+    private fun logStageMetric(metric: StageMetric) {
+        val name = when (metric.kind) {
+            StageMetric.Kind.TTFT -> "translate_ttft"
+            StageMetric.Kind.PIECE -> "translate_piece"
+            StageMetric.Kind.FINAL -> "translate_final_latency"
+            StageMetric.Kind.FORCED_COMMIT -> "waitk_forced_commit"
+            StageMetric.Kind.FINAL_TTFT -> "translate_final_ttft"
+            StageMetric.Kind.MERGED_FINALS -> "translate_merged_finals"
+            StageMetric.Kind.PREVIEW_TTFT -> "translate_preview_ttft"
+            StageMetric.Kind.PREVIEW_CANCELLED -> "translate_preview_cancelled"
+        }
+        BenchLog.metric("$name ms=${metric.ms} src_len=${metric.sourceChars}")
+        _stageMetrics.tryEmit(metric)
+    }
+
+    /**
+     * Whether [text] opens a new sentence: its first letter is a capital in a
+     * cased script, other than the pronoun "I", which starts clauses too.
+     */
+    private fun startsNewSentence(text: String): Boolean {
+        val trimmed = text.trimStart { !it.isLetterOrDigit() }
+        val first = trimmed.firstOrNull() ?: return false
+        if (!first.isUpperCase()) return false
+        val word = trimmed.takeWhile { it.isLetterOrDigit() || it == '\'' }
+        return word != "I" && !word.startsWith("I'")
+    }
+
+    /**
+     * Punctuates text being flushed from the pool. A flush means no further
+     * recognition is coming for this sentence, so it genuinely ends here even
+     * though the recogniser never said so.
+     */
+    private fun terminate(text: String): String =
+        punctuation?.restore(text, addTerminator = true, capitalise = false) ?: text
+
+    // ---- Partial handling -------------------------------------------------
+    //
+    // Partials are throwaway, ever-growing hypotheses. Re-translating the whole
+    // growing block on every tick is wasteful AND makes the caption reflow —
+    // NMT reorders earlier words as more context arrives, so text the reader
+    // already read keeps changing. To avoid that we split each partial into:
+    //   - a STABLE prefix: the completed sentences up to the last terminator,
+    //     translated once and cached until the prefix itself changes;
+    //   - a TAIL: the in-progress clause after the last terminator,
+    //     re-translated (throttled) as it grows.
+    // The emitted caption is prefixTranslation + tailTranslation, so already-
+    // spoken sentences stop shifting under the reader and only the live clause
+    // moves. A translation failure degrades to source text, never throws.
+
+    private var partialStablePrefix = ""
+    private var partialStablePrefixTranslation = ""
+    private var lastPartialTail = ""
+    private var lastPartialTailTranslation = ""
+    private var lastPartialTranslatedAtNanos = 0L
+
+    private fun resetPartialThrottle() {
+        partialStablePrefix = ""
+        partialStablePrefixTranslation = ""
+        lastPartialTail = ""
+        lastPartialTailTranslation = ""
+        lastPartialTranslatedAtNanos = 0L
+    }
+
+    private suspend fun processPartialResult(
+        pendingText: String,
+        partialText: String,
+    ): Caption? {
+        val trimmed = partialText.trim()
+        if (trimmed.isEmpty()) return null
+
+        val tentativeSentence = "$pendingText $trimmed".trim()
+
+        // Some engines are finals-only (see SublyTranslator.translatesPartials
+        // — an on-device LLM is seconds per call, and this runs on the
+        // coroutine collecting ASR results). Show the hypothesis as source
+        // text: the same degradation a failed partial translation already
+        // gets. Returning here rather than short-circuiting the translate call
+        // also skips the prefix/tail throttle, which exists to ration
+        // translations — with none being made, rationing them would only
+        // leave the caption showing a stale, shorter hypothesis than the one
+        // the recogniser just produced.
+        if (!translationEngine.translatesPartials) {
+            BenchLog.metric(
+                "translate_skip kind=partial reason=engine src_len=${tentativeSentence.length}"
+            )
+            return Caption(
+                originalText = tentativeSentence,
+                translatedText = tentativeSentence,
+                isFinal = false,
+                mode = Caption.CaptureMode.AUDIO,
+            )
+        }
+
+        // Split at the last sentence terminator: everything before it is
+        // settled and won't change; only the tail is still in flux.
+        val splitAt = lastTerminatorEnd(tentativeSentence)
+        val prefix = tentativeSentence.substring(0, splitAt).trim()
+        val tail = tentativeSentence.substring(splitAt).trim()
+
+        // Stable prefix: translate once, re-translate only when it changes
+        // (i.e. a new sentence just completed). Cost is O(sentences), not
+        // O(partials).
+        if (prefix != partialStablePrefix) {
+            partialStablePrefixTranslation =
+                if (prefix.isEmpty()) "" else translatePartial(prefix)
+            partialStablePrefix = prefix
+        }
+
+        // Tail: the only part re-translated per tick, and throttled.
+        if (tail.isEmpty()) {
+            lastPartialTail = ""
+            lastPartialTailTranslation = ""
+        } else {
+            val grewEnough =
+                tail.length - lastPartialTail.length >= PARTIAL_RETRANSLATE_MIN_GROWTH
+            val agedEnough =
+                (System.nanoTime() - lastPartialTranslatedAtNanos) / 1_000_000 >= PARTIAL_RETRANSLATE_MIN_INTERVAL_MS
+            val shouldTranslate =
+                tail != lastPartialTail &&
+                    (lastPartialTailTranslation.isEmpty() || grewEnough || agedEnough)
+            if (shouldTranslate) {
+                lastPartialTailTranslation = translatePartial(tail)
+                lastPartialTail = tail
+                lastPartialTranslatedAtNanos = System.nanoTime()
+            } else if (tail != lastPartialTail) {
+                BenchLog.metric("translate_skip kind=partial reason=throttle src_len=${tail.length}")
+            }
+        }
+
+        val translation = listOf(partialStablePrefixTranslation, lastPartialTailTranslation)
+            .filter { it.isNotEmpty() }
+            .joinToString(" ")
+
+        return Caption(
+            originalText = tentativeSentence,
+            translatedText = translation,
+            isFinal = false,
+            mode = Caption.CaptureMode.AUDIO,
+        )
+    }
+
+    /** Index just past the last sentence terminator, or 0 if there is none. */
+    private fun lastTerminatorEnd(text: String): Int {
+        for (i in text.indices.reversed()) {
+            if (text[i] in SENTENCE_TERMINATORS) return i + 1
+        }
+        return 0
+    }
+
+    /** Partial translation: degrade to the source text on failure, never throw. */
+    private suspend fun translatePartial(text: String): String {
+        val startNanos = System.nanoTime()
+        return try {
+            val out = translationEngine.translate(text)
+            logTranslateMetric("partial", text, out, startNanos, ok = true)
+            out
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logTranslateMetric("partial", text, "", startNanos, ok = false)
+            Log.w(TAG, "Partial translation failed; emitting source text", e)
+            text
+        }
+    }
+
+    // ---- Final handling ---------------------------------------------------
+
+    private var lastFinalOriginal = ""
+
+    /**
+     * Whisper sometimes emits the same sentence twice (a 2x repetition is
+     * below [RepetitionFilter]'s collapse threshold because speakers do
+     * legitimately repeat themselves — but two *finalized captions* back to
+     * back are never useful). Dropping here also saves the duplicate
+     * translation call.
+     *
+     * Backstop to the [SentenceExtractor] de-overlap: that strips word-level
+     * overlap *within* the pool, but whole-sentence repeats that survive
+     * (e.g. one window ending a sentence and the next re-decoding it under the
+     * audio overlap) are caught here. Matching is normalized (case- and
+     * punctuation-insensitive) and also fires when one of the two fully
+     * contains the other, so near-duplicates collapse too.
+     */
+    private fun isDuplicateFinal(sentence: String): Boolean {
+        val now = normalizeForDedupe(sentence)
+        val prev = normalizeForDedupe(lastFinalOriginal)
+        val duplicate = now.isNotEmpty() && prev.isNotEmpty() &&
+            (now == prev ||
+                (now.length >= DEDUPE_MIN_CONTAIN_LEN && prev.contains(now)) ||
+                (prev.length >= DEDUPE_MIN_CONTAIN_LEN && now.contains(prev)))
+        if (duplicate) {
+            BenchLog.metric("caption_dedupe len=${sentence.length}")
+            // Keep the longer/newer form as the reference so a growing repeat
+            // doesn't keep matching the shortest seen variant.
+            if (now.length >= prev.length) lastFinalOriginal = sentence
+            return true
+        }
+        lastFinalOriginal = sentence
+        return false
+    }
+
+    /** Lowercase, strip punctuation, collapse whitespace for dedupe compares. */
+    private fun normalizeForDedupe(text: String): String =
+        text.lowercase(Locale.forLanguageTag(config.source))
+            .replace(NON_ALNUM, " ")
+            .trim()
+            .replace(MULTI_SPACE, " ")
+
+    private suspend fun buildFinalCaption(sentence: String, kind: String): Caption =
+        Caption(
+            originalText = sentence,
+            translatedText = translateFinalOrThrow(sentence, kind),
+            isFinal = true,
+            mode = Caption.CaptureMode.AUDIO,
+        )
+
+    private suspend fun translateFinalOrThrow(text: String, kind: String): String {
+        val startNanos = System.nanoTime()
+        return try {
+            val out = translationEngine.translate(text)
+            logTranslateMetric(kind, text, out, startNanos, ok = true)
+            out
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logTranslateMetric(kind, text, "", startNanos, ok = false)
+            throw SublyError.TranslationFailed(e)
+        }
+    }
+
+    private fun logTranslateMetric(
+        kind: String,
+        src: String,
+        dst: String,
+        startNanos: Long,
+        ok: Boolean,
+    ) {
+        val ms = (System.nanoTime() - startNanos) / 1_000_000
+        BenchLog.metric(
+            "translate kind=$kind ms=$ms src_len=${src.length} dst_len=${dst.length} ok=$ok"
+        )
+        // Content for accuracy evaluation; no-op unless VERBOSE opted in.
+        BenchLog.transcript("translate_text kind=$kind src=\"$src\" dst=\"$dst\"")
+    }
+
+    private fun checkNotClosed() = check(_state.value !is EngineState.Closed) {
+        "This SublySession is closed. Create a new one via Subly.createSession()."
+    }
+
+    private companion object {
+        const val TAG = "SublySession"
+
+        /**
+         * Sentence terminators used to freeze the completed-sentence prefix of
+         * a partial (mirrors [SentenceExtractor]'s set, including CJK marks).
+         */
+        val SENTENCE_TERMINATORS = setOf('.', '!', '?', '…', '。', '！', '？', '．')
+
+        /**
+         * Cap on the one-off translator warm-up during preparation. Sized for
+         * an on-device LLM's first generation on older hardware, not for
+         * ML Kit's ~500 ms lazy init.
+         */
+        const val WARM_UP_TIMEOUT_MS = 120_000L
+
+        /** Pool remainder is flushed as a final this long after the last ASR final. */
+        const val IDLE_FLUSH_MS = 3_000L
+
+        /**
+         * Idle timeout used instead of [IDLE_FLUSH_MS] when the recogniser
+         * reported that its last final did not end a sentence.
+         *
+         * Sized just past whisper's p75 gap (6.6 s on the benchmark device),
+         * not its p90. Waiting for the p90 was measured and overshot: caption
+         * count fell to 0.5-0.8 per reference sentence, merging separate
+         * sentences into one over-long caption and delaying every one of them
+         * to the end of the stream. Beating the common gap is what joins a
+         * split sentence; waiting for the rare one just strands text.
+         */
+        const val CONTINUATION_FLUSH_MS = 7_000L
+
+        /** Regexes/threshold for normalized near-duplicate final detection. */
+        val NON_ALNUM = Regex("[^\\p{L}\\p{N}]+")
+        val MULTI_SPACE = Regex("\\s+")
+
+        /**
+         * Containment-based dedupe only fires when the contained string is at
+         * least this many normalized chars — short fragments ("yes", "okay")
+         * are legitimately repeated and substrings of many sentences.
+         */
+        const val DEDUPE_MIN_CONTAIN_LEN = 12
+
+        /** Re-translate a partial only if it grew by this many chars… */
+        const val PARTIAL_RETRANSLATE_MIN_GROWTH = 12
+
+        /** …or this much time passed since the last partial translation. */
+        const val PARTIAL_RETRANSLATE_MIN_INTERVAL_MS = 1_200L
+    }
+}

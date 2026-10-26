@@ -1,0 +1,294 @@
+{
+  "clips": [
+    {
+      "id": "fleurs_en_01",
+      "language": "en",
+      "audio": "audio/fleurs_en_01.mp4",
+      "durationSec": 23,
+      "transcript": "references/fleurs_en_01.transcript.txt",
+      "translations": {
+        "vi": "references/fleurs_en_01.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), en_us. Sentence ids 1661..1664, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_en_02",
+      "language": "en",
+      "audio": "audio/fleurs_en_02.mp4",
+      "durationSec": 31,
+      "transcript": "references/fleurs_en_02.transcript.txt",
+      "translations": {
+        "vi": "references/fleurs_en_02.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), en_us. Sentence ids 1665..1667, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_en_03",
+      "language": "en",
+      "audio": "audio/fleurs_en_03.mp4",
+      "durationSec": 30,
+      "transcript": "references/fleurs_en_03.transcript.txt",
+      "translations": {
+        "vi": "references/fleurs_en_03.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), en_us. Sentence ids 1668..1671, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_en_04",
+      "language": "en",
+      "audio": "audio/fleurs_en_04.mp4",
+      "durationSec": 23,
+      "transcript": "references/fleurs_en_04.transcript.txt",
+      "translations": {
+        "vi": "references/fleurs_en_04.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), en_us. Sentence ids 1672..1675, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_en_05",
+      "language": "en",
+      "audio": "audio/fleurs_en_05.mp4",
+      "durationSec": 20,
+      "transcript": "references/fleurs_en_05.transcript.txt",
+      "translations": {
+        "vi": "references/fleurs_en_05.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), en_us. Sentence ids 1676..1679, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_ja_01",
+      "language": "ja",
+      "audio": "audio/fleurs_ja_01.mp4",
+      "durationSec": 38,
+      "transcript": "references/fleurs_ja_01.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_ja_01.translation.en.txt",
+        "vi": "references/fleurs_ja_01.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), ja_jp. Sentence ids 1661..1664, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_ja_02",
+      "language": "ja",
+      "audio": "audio/fleurs_ja_02.mp4",
+      "durationSec": 45,
+      "transcript": "references/fleurs_ja_02.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_ja_02.translation.en.txt",
+        "vi": "references/fleurs_ja_02.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), ja_jp. Sentence ids 1665..1667, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_ja_03",
+      "language": "ja",
+      "audio": "audio/fleurs_ja_03.mp4",
+      "durationSec": 44,
+      "transcript": "references/fleurs_ja_03.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_ja_03.translation.en.txt",
+        "vi": "references/fleurs_ja_03.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), ja_jp. Sentence ids 1668..1671, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_ja_04",
+      "language": "ja",
+      "audio": "audio/fleurs_ja_04.mp4",
+      "durationSec": 35,
+      "transcript": "references/fleurs_ja_04.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_ja_04.translation.en.txt",
+        "vi": "references/fleurs_ja_04.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), ja_jp. Sentence ids 1672..1675, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_ja_05",
+      "language": "ja",
+      "audio": "audio/fleurs_ja_05.mp4",
+      "durationSec": 29,
+      "transcript": "references/fleurs_ja_05.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_ja_05.translation.en.txt",
+        "vi": "references/fleurs_ja_05.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), ja_jp. Sentence ids 1676..1679, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_zh_01",
+      "language": "zh",
+      "audio": "audio/fleurs_zh_01.mp4",
+      "durationSec": 31,
+      "transcript": "references/fleurs_zh_01.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_zh_01.translation.en.txt",
+        "vi": "references/fleurs_zh_01.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), cmn_hans_cn. Sentence ids 1661..1664, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_zh_02",
+      "language": "zh",
+      "audio": "audio/fleurs_zh_02.mp4",
+      "durationSec": 35,
+      "transcript": "references/fleurs_zh_02.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_zh_02.translation.en.txt",
+        "vi": "references/fleurs_zh_02.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), cmn_hans_cn. Sentence ids 1665..1667, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_zh_03",
+      "language": "zh",
+      "audio": "audio/fleurs_zh_03.mp4",
+      "durationSec": 29,
+      "transcript": "references/fleurs_zh_03.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_zh_03.translation.en.txt",
+        "vi": "references/fleurs_zh_03.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), cmn_hans_cn. Sentence ids 1668..1671, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_zh_04",
+      "language": "zh",
+      "audio": "audio/fleurs_zh_04.mp4",
+      "durationSec": 34,
+      "transcript": "references/fleurs_zh_04.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_zh_04.translation.en.txt",
+        "vi": "references/fleurs_zh_04.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), cmn_hans_cn. Sentence ids 1672..1675, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_zh_05",
+      "language": "zh",
+      "audio": "audio/fleurs_zh_05.mp4",
+      "durationSec": 24,
+      "transcript": "references/fleurs_zh_05.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_zh_05.translation.en.txt",
+        "vi": "references/fleurs_zh_05.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), cmn_hans_cn. Sentence ids 1676..1679, the same FLoRes-101 sentences in every language, so clips are parallel across en/zh/ja and the references are FLoRes human translations rather than machine output. Caveat: FLEURS utterances are independently read single sentences, so this clip concatenates unrelated sentences - the topic changes roughly every 10 s, and an ASR endpoint always coincides with a sentence end, which flatters punctuation restoration compared with continuous speech."
+    },
+    {
+      "id": "fleurs_es_01",
+      "language": "es",
+      "audio": "audio/fleurs_es_01.mp4",
+      "durationSec": 46,
+      "transcript": "references/fleurs_es_01.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_es_01.translation.en.txt",
+        "vi": "references/fleurs_es_01.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), es_419. Sentence ids 1661..1664, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_es_02",
+      "language": "es",
+      "audio": "audio/fleurs_es_02.mp4",
+      "durationSec": 44,
+      "transcript": "references/fleurs_es_02.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_es_02.translation.en.txt",
+        "vi": "references/fleurs_es_02.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), es_419. Sentence ids 1665..1667, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_es_03",
+      "language": "es",
+      "audio": "audio/fleurs_es_03.mp4",
+      "durationSec": 72,
+      "transcript": "references/fleurs_es_03.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_es_03.translation.en.txt",
+        "vi": "references/fleurs_es_03.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), es_419. Sentence ids 1668..1671, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_es_04",
+      "language": "es",
+      "audio": "audio/fleurs_es_04.mp4",
+      "durationSec": 50,
+      "transcript": "references/fleurs_es_04.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_es_04.translation.en.txt",
+        "vi": "references/fleurs_es_04.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), es_419. Sentence ids 1672..1675, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_es_05",
+      "language": "es",
+      "audio": "audio/fleurs_es_05.mp4",
+      "durationSec": 46,
+      "transcript": "references/fleurs_es_05.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_es_05.translation.en.txt",
+        "vi": "references/fleurs_es_05.translation.vi.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), es_419. Sentence ids 1676..1679, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_vi_01",
+      "language": "vi",
+      "audio": "audio/fleurs_vi_01.mp4",
+      "durationSec": 48,
+      "transcript": "references/fleurs_vi_01.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_vi_01.translation.en.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), vi_vn. Sentence ids 1661..1664, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_vi_02",
+      "language": "vi",
+      "audio": "audio/fleurs_vi_02.mp4",
+      "durationSec": 41,
+      "transcript": "references/fleurs_vi_02.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_vi_02.translation.en.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), vi_vn. Sentence ids 1665..1667, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_vi_03",
+      "language": "vi",
+      "audio": "audio/fleurs_vi_03.mp4",
+      "durationSec": 74,
+      "transcript": "references/fleurs_vi_03.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_vi_03.translation.en.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), vi_vn. Sentence ids 1668..1671, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_vi_04",
+      "language": "vi",
+      "audio": "audio/fleurs_vi_04.mp4",
+      "durationSec": 44,
+      "transcript": "references/fleurs_vi_04.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_vi_04.translation.en.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), vi_vn. Sentence ids 1672..1675, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    },
+    {
+      "id": "fleurs_vi_05",
+      "language": "vi",
+      "audio": "audio/fleurs_vi_05.mp4",
+      "durationSec": 45,
+      "transcript": "references/fleurs_vi_05.transcript.txt",
+      "translations": {
+        "en": "references/fleurs_vi_05.translation.en.txt"
+      },
+      "notes": "Google FLEURS test split (CC-BY-4.0), vi_vn. Sentence ids 1676..1679, the same FLoRes-101 sentences as the en/zh/ja clips; first recording of each id, loudness-normalised per utterance (-16 LUFS), 0.6 s gaps. Translation references are the FLoRes texts of the same ids."
+    }
+  ]
+}
